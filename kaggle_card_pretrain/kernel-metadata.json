@@ -1,0 +1,20 @@
+{
+  "id": "f7e6n5g4/ptcg-card-pretrain",
+  "title": "ptcg-card-pretrain",
+  "code_file": "run_card_pretrain.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "machine_shape": "",
+  "dataset_sources": [
+    "f7e6n5g4/ptcg-cg-runtime-dataset"
+  ],
+  "competition_sources": [
+    "pokemon-tcg-ai-battle"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}

@@ -1,0 +1,33 @@
+seed: 20260710
+
+data:
+  cache_dir: artifacts/card_data
+  validation_ratio: 0.15
+  split_mode: card_id
+
+model:
+  embedding_dim: 128
+  text_encoder_name: hashing
+  freeze_text_encoder: false
+
+training:
+  batch_size: 128
+  relation_batch_size: 96
+  attack_relation_batch_size: 96
+  learning_rate: 0.0005
+  weight_decay: 0.01
+  epochs: 1
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  device: auto
+
+tasks:
+  mask_probability: 0.15
+  temperature: 0.07
+  energy_separation_margin: 0.25
+
+loss_weights:
+  mask: 1.0
+  contrastive: 1.0
+  relation: 1.0
+  energy: 0.25

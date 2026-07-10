@@ -1,0 +1,50 @@
+# Python / test cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environments and secrets
+.env
+.env.*
+*.local
+.kaggle/
+
+# Generated training artifacts and local outputs
+artifacts/
+outputs/
+checkpoints/
+logs/
+runs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.parquet
+
+# Kaggle / competition downloads and extracted runtimes
+pokemon-tcg-ai-battle.zip
+cri_rulebook_en.pdf
+kaggle_cg_runtime_dataset/cg/
+kaggle_cg_runtime/__pycache__/
+kaggle_kernel/__pycache__/
+
+# Generated or duplicated self-contained kernel source snapshots
+kaggle_card_pretrain/data/
+kaggle_card_pretrain/models/
+kaggle_card_pretrain/training/
+kaggle_card_pretrain/configs/
+
+# Collaboration/local agent state
+.agents/
+.codex/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

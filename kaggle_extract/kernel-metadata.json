@@ -1,0 +1,18 @@
+{
+  "id": "f7e6n5g4/ptcg-popular-deck-extract",
+  "title": "ptcg-popular-deck-extract",
+  "code_file": "extract_popular_decks.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "machine_shape": "",
+  "dataset_sources": [],
+  "competition_sources": [
+    "pokemon-tcg-ai-battle"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}
