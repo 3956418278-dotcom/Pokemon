@@ -7,19 +7,32 @@ data:
 
 model:
   embedding_dim: 128
+  detail_token_dim: 128
+  detail_pooling: attention
   text_encoder_name: hashing
   freeze_text_encoder: false
 
 training:
-  batch_size: 128
+  batch_size: 64
   relation_batch_size: 96
   attack_relation_batch_size: 96
-  learning_rate: 0.0005
-  weight_decay: 0.01
-  epochs: 1
+  max_epochs: 400
+  min_epochs: 80
+  eval_every_epochs: 5
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-4
   checkpoint_dir: checkpoints
   log_dir: logs
-  device: auto
+  device: cpu
+  early_stopping:
+    enabled: true
+    patience: 40
+    restore_best_checkpoint: true
+  masking:
+    categorical_probability: 0.10
+    numeric_probability: 0.10
+    text_token_dropout: 0.10
+    detail_field_probability: 0.10
 
 tasks:
   mask_probability: 0.15
@@ -30,4 +43,5 @@ loss_weights:
   mask: 1.0
   contrastive: 1.0
   relation: 1.0
-  energy: 0.25
+  detail: 1.0
+  energy: 0.0

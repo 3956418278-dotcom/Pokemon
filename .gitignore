@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.tmp/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
@@ -19,6 +20,10 @@ checkpoints/
 logs/
 runs/
 wandb/
+kaggle_dynamic_state_tests_output*/
+data_from_submission/replay_audit/
+data_from_submission/replay_dataset/
+data_from_submission/replays/
 *.pt
 *.pth
 *.ckpt

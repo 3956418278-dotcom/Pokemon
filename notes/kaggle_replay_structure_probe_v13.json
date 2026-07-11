@@ -1,0 +1,171 @@
+{
+  "index": {
+    "path": "/kaggle/input/pokemon-tcg-ai-battle-episodes-index",
+    "exists": true,
+    "manifest_exists": true,
+    "manifest_head": [
+      "date,daily_dataset_slug,daily_dataset_url,episode_count,total_bytes,top_avg_score,median_avg_score",
+      "2026-06-16,pokemon-tcg-ai-battle-episodes-2026-06-16,https://www.kaggle.com/datasets/kaggle/pokemon-tcg-ai-battle-episodes-2026-06-16,1277,2854565943,1024.643707,627.771126",
+      "2026-06-17,pokemon-tcg-ai-battle-episodes-2026-06-17,https://www.kaggle.com/datasets/kaggle/pokemon-tcg-ai-battle-episodes-2026-06-17,7819,21474554811,1259.804498,761.005766",
+      "2026-06-18,pokemon-tcg-ai-battle-episodes-2026-06-18,https://www.kaggle.com/datasets/kaggle/pokemon-tcg-ai-battle-episodes-2026-06-18,6532,21474554331,1327.123541,926.601386"
+    ]
+  },
+  "train_dir": {
+    "path": "/kaggle/input/pokemon-tcg-ai-battle-episodes-2026-07-07",
+    "exists": true,
+    "first_json_files": [
+      "84486998.json",
+      "84487107.json",
+      "84487115.json"
+    ]
+  },
+  "reserved_dir": {
+    "path": "/kaggle/input/pokemon-tcg-ai-battle-episodes-2026-07-10",
+    "exists": true,
+    "first_json_files": [
+      "85109456.json",
+      "85109552.json",
+      "85109566.json"
+    ]
+  },
+  "train_replay_structure": {
+    "exists": true,
+    "path": "/kaggle/input/pokemon-tcg-ai-battle-episodes-2026-07-07/84486998.json",
+    "size_bytes": 2660437,
+    "top_keys": [
+      "configuration",
+      "description",
+      "id",
+      "info",
+      "module_version",
+      "name",
+      "rewards",
+      "schema_version",
+      "specification",
+      "statuses",
+      "steps",
+      "title",
+      "version"
+    ],
+    "info_keys": [
+      "Agents",
+      "EpisodeId",
+      "LiveVideoPath",
+      "TeamNames"
+    ],
+    "step_count": 111,
+    "first_step_agent_count": 2,
+    "first_agent_keys": [
+      "action",
+      "info",
+      "observation",
+      "reward",
+      "status",
+      "visualize"
+    ],
+    "first_observation_keys": [
+      "current",
+      "logs",
+      "remainingOverageTime",
+      "search_begin_input",
+      "select",
+      "step"
+    ],
+    "first_current_keys": [],
+    "first_select_keys": [],
+    "parsed_probe": {
+      "card_instances": 0,
+      "events": 0,
+      "select_options": 0,
+      "select_type": -1,
+      "select_context": -1
+    }
+  },
+  "reserved_replay_structure": {
+    "exists": true,
+    "path": "/kaggle/input/pokemon-tcg-ai-battle-episodes-2026-07-10/85109456.json",
+    "size_bytes": 5188324,
+    "top_keys": [
+      "configuration",
+      "description",
+      "id",
+      "info",
+      "module_version",
+      "name",
+      "rewards",
+      "schema_version",
+      "specification",
+      "statuses",
+      "steps",
+      "title",
+      "version"
+    ],
+    "info_keys": [
+      "Agents",
+      "EpisodeId",
+      "LiveVideoPath",
+      "TeamNames"
+    ],
+    "step_count": 181,
+    "first_step_agent_count": 2,
+    "first_agent_keys": [
+      "action",
+      "info",
+      "observation",
+      "reward",
+      "status",
+      "visualize"
+    ],
+    "first_observation_keys": [
+      "current",
+      "logs",
+      "remainingOverageTime",
+      "search_begin_input",
+      "select",
+      "step"
+    ],
+    "first_current_keys": [],
+    "first_select_keys": [],
+    "parsed_probe": {
+      "card_instances": 0,
+      "events": 0,
+      "select_options": 0,
+      "select_type": -1,
+      "select_context": -1
+    }
+  },
+  "train_dataset_probe": {
+    "sample_count": 10,
+    "skipped_no_select": 3,
+    "parser_errors": [],
+    "max_instances": 22,
+    "max_options": 3,
+    "max_events": 46,
+    "max_token_estimate": 43,
+    "first_sample": {
+      "episode_id": 84486998,
+      "step_index": 1,
+      "agent_index": 0,
+      "option_count": 2,
+      "select_type": 9,
+      "select_context": 41
+    }
+  },
+  "reserved_dataset_probe": {
+    "sample_count": 10,
+    "skipped_no_select": 4,
+    "parser_errors": [],
+    "max_instances": 22,
+    "max_options": 6,
+    "max_events": 19,
+    "max_token_estimate": 43,
+    "first_sample": {
+      "episode_id": 85109456,
+      "step_index": 1,
+      "agent_index": 0,
+      "option_count": 2,
+      "select_type": 9,
+      "select_context": 41
+    }
+  }
+}

@@ -66,6 +66,28 @@ class AttackOwnerHead(nn.Module):
         return self.net(torch.cat([card_embedding, attack_features], dim=-1)).squeeze(-1)
 
 
+class DetailPredictionHead(nn.Module):
+    def __init__(self, schema: dict[str, Any], detail_dim: int = 128) -> None:
+        super().__init__()
+        sizes = infer_head_sizes(schema)
+        self.detail_type = nn.Linear(detail_dim, sizes["detail_type"])
+        self.attack_energy = nn.Linear(detail_dim, 12)
+        self.attack_total_energy = nn.Linear(detail_dim, 1)
+        self.attack_damage = nn.Linear(detail_dim, 1)
+        self.attack_damage_mode = nn.Linear(detail_dim, sizes["damage_mode"])
+        self.effect_source_type = nn.Linear(detail_dim, sizes["effect_source_type"])
+
+    def forward(self, detail_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {
+            "detail_type": self.detail_type(detail_tokens),
+            "attack_energy": self.attack_energy(detail_tokens),
+            "attack_total_energy": self.attack_total_energy(detail_tokens).squeeze(-1),
+            "attack_damage": self.attack_damage(detail_tokens).squeeze(-1),
+            "attack_damage_mode": self.attack_damage_mode(detail_tokens),
+            "effect_source_type": self.effect_source_type(detail_tokens),
+        }
+
+
 def info_nce_loss(text_embedding: torch.Tensor, structure_embedding: torch.Tensor, temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
     logits = text_embedding @ structure_embedding.t() / max(temperature, 1e-6)
     target = torch.arange(logits.size(0), device=logits.device)
@@ -108,6 +130,86 @@ def masked_field_loss(pred: dict[str, torch.Tensor], batch: dict[str, torch.Tens
         metrics["mask_energy_type_acc"] = float(
             (pred["energy_type"].argmax(dim=1)[valid_energy] == batch["energy_type_target"][valid_energy])
             .float()
+            .mean()
+            .detach()
+            .cpu()
+        )
+    return total, metrics
+
+
+def detail_prediction_loss(
+    pred: dict[str, torch.Tensor],
+    detail_mask: torch.Tensor,
+    detail_type_ids: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    valid = detail_mask > 0
+    losses: dict[str, torch.Tensor] = {}
+    if bool(valid.any().item()):
+        losses["detail_type"] = F.cross_entropy(pred["detail_type"][valid], detail_type_ids[valid])
+    else:
+        losses["detail_type"] = pred["detail_type"].sum() * 0.0
+
+    attack_count = batch["attack_mask"].size(1)
+    ability_count = batch["ability_mask"].size(1)
+    attack_mask = batch["attack_mask"] > 0
+    if bool(attack_mask.any().item()):
+        attack_slice = slice(0, attack_count)
+        losses["attack_energy"] = F.smooth_l1_loss(
+            pred["attack_energy"][:, attack_slice][attack_mask],
+            batch["attack_energy_counts"][attack_mask],
+        )
+        losses["attack_total_energy"] = F.smooth_l1_loss(
+            pred["attack_total_energy"][:, attack_slice][attack_mask],
+            batch["attack_total_energy_cost"][attack_mask],
+        )
+        damage_mask = attack_mask & (batch["attack_damage_mask"] > 0)
+        if bool(damage_mask.any().item()):
+            losses["attack_damage"] = F.smooth_l1_loss(
+                pred["attack_damage"][:, attack_slice][damage_mask],
+                batch["attack_damage"][damage_mask],
+            )
+        else:
+            losses["attack_damage"] = pred["attack_damage"].sum() * 0.0
+        losses["attack_damage_mode"] = F.cross_entropy(
+            pred["attack_damage_mode"][:, attack_slice][attack_mask],
+            batch["attack_damage_mode"][attack_mask],
+        )
+    else:
+        zero = pred["attack_energy"].sum() * 0.0
+        losses["attack_energy"] = zero
+        losses["attack_total_energy"] = zero
+        losses["attack_damage"] = zero
+        losses["attack_damage_mode"] = zero
+
+    effect_start = attack_count + ability_count
+    effect_mask = batch["effect_mask"] > 0
+    if bool(effect_mask.any().item()):
+        losses["effect_source_type"] = F.cross_entropy(
+            pred["effect_source_type"][:, effect_start:][effect_mask],
+            batch["effect_source_type"][effect_mask],
+        )
+    else:
+        losses["effect_source_type"] = pred["effect_source_type"].sum() * 0.0
+
+    total = sum(losses.values()) / len(losses)
+    metrics = {f"detail_{name}_loss": float(value.detach().cpu()) for name, value in losses.items()}
+    if bool(valid.any().item()):
+        metrics["detail_type_acc"] = float((pred["detail_type"][valid].argmax(dim=-1) == detail_type_ids[valid]).float().mean().detach().cpu())
+    if bool(attack_mask.any().item()):
+        metrics["detail_attack_damage_mode_acc"] = float(
+            (
+                pred["attack_damage_mode"][:, :attack_count][attack_mask].argmax(dim=-1)
+                == batch["attack_damage_mode"][attack_mask]
+            )
+            .float()
+            .mean()
+            .detach()
+            .cpu()
+        )
+        metrics["detail_attack_energy_mae"] = float(
+            (pred["attack_energy"][:, :attack_count][attack_mask] - batch["attack_energy_counts"][attack_mask])
+            .abs()
             .mean()
             .detach()
             .cpu()

@@ -8,7 +8,7 @@ import re
 import sys
 import zipfile
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -19,6 +19,57 @@ DEFAULT_CACHE_DIR = ROOT / "artifacts" / "card_data"
 ENERGY_TYPES = ["C", "G", "R", "W", "L", "P", "F", "D", "M", "N", "Y", "A"]
 NULL_TOKEN = "<NULL>"
 UNK_TOKEN = "<UNK>"
+ENERGY_ALIASES = {
+    "0": "C",
+    "1": "G",
+    "2": "R",
+    "3": "W",
+    "4": "L",
+    "5": "P",
+    "6": "F",
+    "7": "D",
+    "8": "M",
+    "9": "N",
+    "10": "Y",
+    "COLORLESS": "C",
+    "GRASS": "G",
+    "FIRE": "R",
+    "WATER": "W",
+    "LIGHTNING": "L",
+    "PSYCHIC": "P",
+    "FIGHTING": "F",
+    "DARKNESS": "D",
+    "METAL": "M",
+    "DRAGON": "N",
+    "FAIRY": "Y",
+    "TEAM_ROCKET": "A",
+    "TEAM ROCKET": "A",
+    "RAINBOW": "A",
+}
+
+
+@dataclass
+class AttackRecord:
+    attack_id: str | None
+    name: str
+    effect_text: str
+    damage_raw: str | None
+    damage_value: float | None
+    damage_mode: str
+    energy_costs: dict[str, int]
+
+
+@dataclass
+class AbilityRecord:
+    name: str
+    effect_text: str
+
+
+@dataclass
+class EffectRecord:
+    source_type: str
+    name: str | None
+    effect_text: str
 
 
 @dataclass
@@ -46,6 +97,9 @@ class CardRecord:
     provided_energy_types: list[str]
     full_effect_text: str
     attack_ids: list[int]
+    attacks: list[AttackRecord] = field(default_factory=list)
+    abilities: list[AbilityRecord] = field(default_factory=list)
+    special_effects: list[EffectRecord] = field(default_factory=list)
 
 
 def stable_hash(text: str, modulo: int) -> int:
@@ -82,6 +136,29 @@ def parse_damage(value: Any) -> int | None:
     return numbers[0]
 
 
+def parse_damage_mode(value: Any) -> str:
+    text = normalize_missing(value)
+    if not text:
+        return "none"
+    lower = text.lower()
+    if "?" in lower:
+        return "variable"
+    if "x" in lower or "×" in lower:
+        return "times"
+    if "+" in lower:
+        return "plus"
+    if re.fullmatch(r"\d+", lower):
+        return "fixed"
+    if re.search(r"\d+", lower):
+        return "variable"
+    return "unknown"
+
+
+def normalize_energy_symbol(symbol: Any) -> str:
+    clean = normalize_missing(symbol).upper().replace("-", "_")
+    return ENERGY_ALIASES.get(clean, clean)
+
+
 def parse_energy_symbols(value: Any) -> list[str]:
     text = normalize_missing(value)
     if not text:
@@ -89,7 +166,7 @@ def parse_energy_symbols(value: Any) -> list[str]:
     symbols = re.findall(r"\{([^}]+)\}", text)
     normalized = []
     for symbol in symbols:
-        clean = symbol.strip().upper()
+        clean = normalize_energy_symbol(symbol)
         if clean:
             normalized.append(clean)
     return normalized
@@ -99,6 +176,15 @@ def energy_cost_dict(value: Any) -> dict[str, int]:
     counts: Counter[str] = Counter()
     for symbol in parse_energy_symbols(value):
         counts[symbol] += 1
+    return dict(sorted(counts.items()))
+
+
+def normalize_energy_costs(costs: dict[str, int]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for key, value in costs.items():
+        symbol = normalize_energy_symbol(key)
+        if symbol:
+            counts[symbol] += int(value)
     return dict(sorted(counts.items()))
 
 
@@ -142,6 +228,24 @@ def stage_from_kind(kind: str) -> str | None:
 
 def trainer_type_from_card_type(card_type: str) -> str | None:
     return card_type if card_type in {"ITEM", "TOOL", "SUPPORTER", "STADIUM"} else None
+
+
+def effect_source_type(card_type: str, rule_flag: str | None = None) -> str:
+    if rule_flag:
+        return "rule_box"
+    if card_type == "ITEM":
+        return "item"
+    if card_type == "SUPPORTER":
+        return "supporter"
+    if card_type == "STADIUM":
+        return "stadium"
+    if card_type == "TOOL":
+        return "tool"
+    if card_type == "SPECIAL_ENERGY":
+        return "special_energy"
+    if card_type in {"TRAINER", "UNKNOWN"}:
+        return "trainer"
+    return "other"
 
 
 def read_csv_from_zip(zip_path: Path, member: str) -> list[dict[str, str]]:
@@ -224,10 +328,7 @@ def build_records() -> tuple[list[CardRecord], dict[str, Any]]:
         card_int = int(card_id)
         cg_card = cg_cards.get(card_int)
 
-        attack_names: list[str] = []
-        attack_texts: list[str] = []
-        attack_damage: list[int | None] = []
-        attack_energy_costs: list[dict[str, int]] = []
+        attacks: list[AttackRecord] = []
         attack_ids: list[int] = []
 
         for row in card_rows:
@@ -236,45 +337,94 @@ def build_records() -> tuple[list[CardRecord], dict[str, Any]]:
             damage = normalize_missing(row.get("Damage"))
             effect = normalize_missing(row.get("Effect Explanation"))
             if move_name or cost or damage:
-                attack_names.append(move_name)
-                attack_texts.append(effect)
-                attack_damage.append(parse_damage(damage))
-                attack_energy_costs.append(energy_cost_dict(cost))
+                attacks.append(
+                    AttackRecord(
+                        attack_id=None,
+                        name=move_name,
+                        effect_text=effect,
+                        damage_raw=damage or None,
+                        damage_value=float(parse_damage(damage)) if parse_damage(damage) is not None else None,
+                        damage_mode=parse_damage_mode(damage),
+                        energy_costs=energy_cost_dict(cost),
+                    )
+                )
 
-        ability_texts: list[str] = []
+        abilities: list[AbilityRecord] = []
         if cg_card is not None:
             for skill in getattr(cg_card, "skills", []) or []:
                 text = normalize_missing(getattr(skill, "text", ""))
                 name = normalize_missing(getattr(skill, "name", ""))
                 if text or name:
-                    ability_texts.append(" ".join(part for part in [name, text] if part))
+                    abilities.append(AbilityRecord(name=name, effect_text=text))
             attack_ids = [int(x) for x in getattr(cg_card, "attacks", []) or []]
             if attack_ids:
-                attack_names = []
-                attack_texts = []
-                attack_damage = []
-                attack_energy_costs = []
+                attacks = []
+                seen_attack_ids: set[int] = set()
                 for attack_id in attack_ids:
+                    if attack_id in seen_attack_ids:
+                        consistency_warnings.append(f"card {card_id} duplicate attack {attack_id}")
+                        continue
+                    seen_attack_ids.add(attack_id)
                     attack = cg_attacks.get(attack_id)
                     if attack is None:
                         consistency_warnings.append(f"card {card_id} references missing attack {attack_id}")
                         continue
-                    attack_names.append(normalize_missing(getattr(attack, "name", "")))
-                    attack_texts.append(normalize_missing(getattr(attack, "text", "")))
-                    attack_damage.append(parse_damage(getattr(attack, "damage", None)))
+                    damage_raw = normalize_missing(getattr(attack, "damage", None))
                     costs = Counter(enum_name(v) or str(v) for v in getattr(attack, "energies", []) or [])
-                    attack_energy_costs.append(dict(sorted(costs.items())))
+                    attacks.append(
+                        AttackRecord(
+                            attack_id=str(attack_id),
+                            name=normalize_missing(getattr(attack, "name", "")),
+                            effect_text=normalize_missing(getattr(attack, "text", "")),
+                            damage_raw=damage_raw or None,
+                            damage_value=float(parse_damage(damage_raw)) if parse_damage(damage_raw) is not None else None,
+                            damage_mode=parse_damage_mode(damage_raw),
+                            energy_costs=normalize_energy_costs(dict(costs)),
+                        )
+                    )
 
         provided_energy_types = parse_energy_symbols(first.get("Type"))
         if card_type == "POKEMON" and provided_energy_types:
             pokemon_type = provided_energy_types[0]
         elif cg_card is not None:
-            pokemon_type = enum_name(getattr(cg_card, "energyType", None))
+            pokemon_type = normalize_energy_symbol(enum_name(getattr(cg_card, "energyType", None)))
         else:
             pokemon_type = None
 
         effects = [normalize_missing(row.get("Effect Explanation")) for row in card_rows]
         full_effect_text = "\n".join(text for text in effects if text)
+        rule_flags = sorted(
+            set(
+                split_flags(first.get("Rule"))
+                + (
+                    [flag for flag in ["ex", "megaEx", "tera", "aceSpec"] if bool(getattr(cg_card, flag, False))]
+                    if cg_card is not None
+                    else []
+                )
+            )
+        )
+        special_effects: list[EffectRecord] = []
+        if card_type in {"ITEM", "SUPPORTER", "STADIUM", "TOOL", "SPECIAL_ENERGY"} and full_effect_text:
+            special_effects.append(
+                EffectRecord(
+                    source_type=effect_source_type(card_type),
+                    name=normalize_missing(first.get("Card Name")) or None,
+                    effect_text=full_effect_text,
+                )
+            )
+        for flag in rule_flags:
+            special_effects.append(
+                EffectRecord(
+                    source_type=effect_source_type(card_type, rule_flag=flag),
+                    name=flag,
+                    effect_text=flag,
+                )
+            )
+        attack_names = [attack.name for attack in attacks]
+        attack_texts = [attack.effect_text for attack in attacks]
+        attack_damage = [int(attack.damage_value) if attack.damage_value is not None else None for attack in attacks]
+        attack_energy_costs = [attack.energy_costs for attack in attacks]
+        ability_texts = [" ".join(part for part in [ability.name, ability.effect_text] if part) for ability in abilities]
         record = CardRecord(
             card_id=card_id,
             name=normalize_missing(first.get("Card Name")) or card_id,
@@ -293,7 +443,7 @@ def build_records() -> tuple[list[CardRecord], dict[str, Any]]:
             else None,
             resistance_value=-30.0 if normalize_missing(first.get("Resistance (Type)")) else None,
             evolves_from=normalize_missing(first.get("Previous stage")) or getattr(cg_card, "evolvesFrom", None),
-            rule_flags=sorted(set(split_flags(first.get("Rule")) + ([flag for flag in ["ex", "megaEx", "tera", "aceSpec"] if bool(getattr(cg_card, flag, False))] if cg_card is not None else []))),
+            rule_flags=rule_flags,
             ability_texts=ability_texts,
             attack_texts=attack_texts,
             attack_names=attack_names,
@@ -303,6 +453,9 @@ def build_records() -> tuple[list[CardRecord], dict[str, Any]]:
             provided_energy_types=provided_energy_types if "ENERGY" in card_type else [],
             full_effect_text=full_effect_text,
             attack_ids=attack_ids,
+            attacks=attacks,
+            abilities=abilities,
+            special_effects=special_effects,
         )
         records.append(record)
 

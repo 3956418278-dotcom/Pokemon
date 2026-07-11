@@ -11,14 +11,16 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from data.card_dataset import CardDataset, collate_cards, split_indices
+from data.card_dataset import CardDataset, collate_cards, split_record_indices
 from data.card_preprocessing import DEFAULT_CACHE_DIR, write_card_cache
 from models.card_encoder import CardEncoder
 from models.card_pretrain_heads import (
     AttackOwnerHead,
+    DetailPredictionHead,
     MaskedFieldHeads,
     RelationHead,
     binary_metrics,
+    detail_prediction_loss,
     energy_separation_loss,
     info_nce_loss,
     masked_field_loss,
@@ -86,25 +88,59 @@ def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
 
 
-def mask_batch(batch: dict[str, Any], mask_probability: float) -> dict[str, Any]:
+def mask_batch(
+    batch: dict[str, Any],
+    mask_probability: float = 0.15,
+    categorical_probability: float | None = None,
+    numeric_probability: float | None = None,
+    text_token_dropout: float | None = None,
+    detail_field_probability: float | None = None,
+) -> dict[str, Any]:
     masked = dict(batch)
-    if mask_probability <= 0:
+    cat_prob = mask_probability if categorical_probability is None else categorical_probability
+    num_prob = mask_probability if numeric_probability is None else numeric_probability
+    text_prob = mask_probability * 0.25 if text_token_dropout is None else text_token_dropout
+    detail_prob = 0.0 if detail_field_probability is None else detail_field_probability
+    if max(cat_prob, num_prob, text_prob, detail_prob) <= 0:
         return masked
     single = batch["single_cats"].clone()
-    mask = torch.rand(single.shape, device=single.device) < mask_probability
+    mask = torch.rand(single.shape, device=single.device) < cat_prob
     single[mask] = 0
     numeric = batch["numeric"].clone()
     numeric_mask = batch["numeric_mask"].clone()
-    nmask = torch.rand(numeric.shape, device=numeric.device) < mask_probability
+    nmask = torch.rand(numeric.shape, device=numeric.device) < num_prob
     numeric[nmask] = 0.0
     numeric_mask[nmask] = 0.0
     text_hashes = batch["text_hashes"].clone()
-    tmask = torch.rand(text_hashes.shape, device=text_hashes.device) < (mask_probability * 0.25)
+    tmask = torch.rand(text_hashes.shape, device=text_hashes.device) < text_prob
     text_hashes[tmask] = 0
     masked["single_cats"] = single
     masked["numeric"] = numeric
     masked["numeric_mask"] = numeric_mask
     masked["text_hashes"] = text_hashes
+    if detail_prob > 0:
+        for key in [
+            "attack_name_mask",
+            "attack_effect_mask",
+            "ability_name_mask",
+            "ability_effect_mask",
+            "effect_name_mask",
+            "effect_text_mask",
+        ]:
+            value = batch[key].clone()
+            value[torch.rand(value.shape, device=value.device) < detail_prob] = 0.0
+            masked[key] = value
+        for key in ["attack_energy_counts", "attack_total_energy_cost", "attack_damage"]:
+            value = batch[key].clone()
+            value[torch.rand(value.shape, device=value.device) < detail_prob] = 0.0
+            masked[key] = value
+        for key in ["attack_damage_mode", "effect_source_type"]:
+            value = batch[key].clone()
+            value[torch.rand(value.shape, device=value.device) < detail_prob] = 0
+            masked[key] = value
+        damage_mask = batch["attack_damage_mask"].clone()
+        damage_mask[torch.rand(damage_mask.shape, device=damage_mask.device) < detail_prob] = 0.0
+        masked["attack_damage_mask"] = damage_mask
     return masked
 
 
@@ -224,6 +260,7 @@ def run_epoch(
     mask_heads: MaskedFieldHeads,
     relation_head: RelationHead,
     attack_owner_head: AttackOwnerHead,
+    detail_head: DetailPredictionHead,
     optimizer: torch.optim.Optimizer | None,
     config: dict[str, Any],
     device: torch.device,
@@ -233,15 +270,26 @@ def run_epoch(
     mask_heads.train(train)
     relation_head.train(train)
     attack_owner_head.train(train)
+    detail_head.train(train)
     relation_pairs = dataset.relation_samples()
     metric_rows = []
     weights = config["loss_weights"]
+    train_cfg = load_training_config(config)
+    mask_cfg = train_cfg["masking"]
     for batch in loader:
         batch = move_batch(batch, device)
-        masked = mask_batch(batch, float(config["tasks"].get("mask_probability", 0.15)))
-        embedding = encoder(masked)
+        masked = mask_batch(batch, **mask_cfg)
+        encoder_output = encoder(masked, return_details=True)
+        embedding = encoder_output.card_summary
         pred = mask_heads(embedding)
         mask_loss, mask_metrics = masked_field_loss(pred, batch)
+        detail_pred = detail_head(encoder_output.detail_tokens)
+        detail_loss, detail_metrics = detail_prediction_loss(
+            detail_pred,
+            encoder_output.detail_mask,
+            encoder_output.detail_type_ids,
+            batch,
+        )
         text_emb = encoder.text_embedding(batch)
         struct_emb = encoder.structure_embedding(batch)
         contrastive_loss, contrast_metrics = info_nce_loss(text_emb, struct_emb, float(config["tasks"].get("temperature", 0.07)))
@@ -280,6 +328,7 @@ def run_epoch(
             float(weights.get("mask", 1.0)) * mask_loss
             + float(weights.get("contrastive", 1.0)) * contrastive_loss
             + float(weights.get("relation", 1.0)) * (relation_loss + attack_loss)
+            + float(weights.get("detail", 1.0)) * detail_loss
             + float(weights.get("energy", 0.25)) * energy_loss
         )
         if train:
@@ -289,7 +338,8 @@ def run_epoch(
                 list(encoder.parameters())
                 + list(mask_heads.parameters())
                 + list(relation_head.parameters())
-                + list(attack_owner_head.parameters()),
+                + list(attack_owner_head.parameters())
+                + list(detail_head.parameters()),
                 1.0,
             )
             optimizer.step()
@@ -300,11 +350,13 @@ def run_epoch(
                 "contrastive_loss": float(contrastive_loss.detach().cpu()),
                 "relation_loss": float(relation_loss.detach().cpu()),
                 "attack_owner_loss": float(attack_loss.detach().cpu()),
+                "detail_loss": float(detail_loss.detach().cpu()),
                 "energy_separation_loss": float(energy_loss.detach().cpu()),
                 **mask_metrics,
                 **contrast_metrics,
                 **rel_metrics,
                 **attack_metrics,
+                **detail_metrics,
             }
         )
     return average_metrics(metric_rows)
@@ -316,6 +368,7 @@ def save_checkpoint(
     mask_heads: MaskedFieldHeads,
     relation_head: RelationHead,
     attack_owner_head: AttackOwnerHead,
+    detail_head: DetailPredictionHead,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     config: dict[str, Any],
@@ -329,6 +382,7 @@ def save_checkpoint(
             "mask_heads": mask_heads.state_dict(),
             "relation_head": relation_head.state_dict(),
             "attack_owner_head": attack_owner_head.state_dict(),
+            "detail_head": detail_head.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "config": config,
@@ -339,6 +393,29 @@ def save_checkpoint(
     )
 
 
+def load_training_config(config: dict[str, Any]) -> dict[str, Any]:
+    training = config["training"]
+    early = training.get("early_stopping", {}) or {}
+    masking = training.get("masking", {}) or {}
+    return {
+        "batch_size": int(training.get("batch_size", 128)),
+        "max_epochs": int(training.get("max_epochs", training.get("epochs", 1))),
+        "min_epochs": int(training.get("min_epochs", 0)),
+        "eval_every_epochs": max(1, int(training.get("eval_every_epochs", 1))),
+        "learning_rate": float(training.get("learning_rate", 0.0005)),
+        "weight_decay": float(training.get("weight_decay", 0.01)),
+        "early_stopping_enabled": bool(early.get("enabled", False)),
+        "early_stopping_patience": int(early.get("patience", 0)),
+        "restore_best_checkpoint": bool(early.get("restore_best_checkpoint", True)),
+        "masking": {
+            "categorical_probability": float(masking.get("categorical_probability", config["tasks"].get("mask_probability", 0.15))),
+            "numeric_probability": float(masking.get("numeric_probability", config["tasks"].get("mask_probability", 0.15))),
+            "text_token_dropout": float(masking.get("text_token_dropout", config["tasks"].get("mask_probability", 0.15) * 0.25)),
+            "detail_field_probability": float(masking.get("detail_field_probability", 0.0)),
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("configs/card_pretrain.yaml"))
@@ -346,6 +423,7 @@ def main() -> None:
     parser.add_argument("--resume", type=Path, default=None)
     args = parser.parse_args()
     config = load_config(args.config)
+    train_cfg = load_training_config(config)
     set_seed(int(config["seed"]))
 
     cache_dir = Path(config["data"].get("cache_dir", DEFAULT_CACHE_DIR))
@@ -353,8 +431,8 @@ def main() -> None:
         summary = write_card_cache(cache_dir)
         print("card preprocessing summary:", json.dumps(summary, indent=2, ensure_ascii=False))
     dataset = CardDataset.from_cache(cache_dir, rebuild=args.rebuild_cache)
-    train_idx, val_idx = split_indices(
-        len(dataset),
+    train_idx, val_idx = split_record_indices(
+        dataset.records,
         float(config["data"].get("validation_ratio", 0.15)),
         int(config["seed"]),
         str(config["data"].get("split_mode", "card_id")),
@@ -365,8 +443,8 @@ def main() -> None:
     train_ds = dataset.subset(train_idx)
     val_ds = dataset.subset(val_idx)
     collate = lambda items: collate_cards(items, dataset.schema)
-    train_loader = DataLoader(train_ds, batch_size=int(config["training"]["batch_size"]), shuffle=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=int(config["training"]["batch_size"]), shuffle=False, collate_fn=collate)
+    train_loader = DataLoader(train_ds, batch_size=train_cfg["batch_size"], shuffle=True, collate_fn=collate)
+    val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"], shuffle=False, collate_fn=collate)
 
     device_name = str(config["training"].get("device", "auto"))
     if device_name == "auto":
@@ -375,18 +453,21 @@ def main() -> None:
     encoder = CardEncoder(
         dataset.schema,
         embedding_dim=int(config["model"].get("embedding_dim", 128)),
+        detail_token_dim=int(config["model"].get("detail_token_dim", config["model"].get("embedding_dim", 128))),
         freeze_text_encoder=bool(config["model"].get("freeze_text_encoder", False)),
     ).to(device)
     mask_heads = MaskedFieldHeads(dataset.schema, int(config["model"].get("embedding_dim", 128))).to(device)
     relation_head = RelationHead(int(config["model"].get("embedding_dim", 128))).to(device)
     attack_owner_head = AttackOwnerHead(int(config["model"].get("embedding_dim", 128))).to(device)
+    detail_head = DetailPredictionHead(dataset.schema, int(config["model"].get("detail_token_dim", config["model"].get("embedding_dim", 128)))).to(device)
     optimizer = torch.optim.AdamW(
         list(encoder.parameters())
         + list(mask_heads.parameters())
         + list(relation_head.parameters())
-        + list(attack_owner_head.parameters()),
-        lr=float(config["training"]["learning_rate"]),
-        weight_decay=float(config["training"].get("weight_decay", 0.01)),
+        + list(attack_owner_head.parameters())
+        + list(detail_head.parameters()),
+        lr=train_cfg["learning_rate"],
+        weight_decay=train_cfg["weight_decay"],
     )
 
     start_epoch = 0
@@ -397,6 +478,8 @@ def main() -> None:
         relation_head.load_state_dict(checkpoint["relation_head"])
         if "attack_owner_head" in checkpoint:
             attack_owner_head.load_state_dict(checkpoint["attack_owner_head"])
+        if "detail_head" in checkpoint:
+            detail_head.load_state_dict(checkpoint["detail_head"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
 
@@ -404,17 +487,84 @@ def main() -> None:
     log_dir = Path(config["training"]["log_dir"])
     log_dir.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
-    for epoch in range(start_epoch, int(config["training"]["epochs"])):
-        train_metrics = run_epoch(dataset, train_loader, encoder, mask_heads, relation_head, attack_owner_head, optimizer, config, device)
-        with torch.no_grad():
-            val_metrics = run_epoch(dataset, val_loader, encoder, mask_heads, relation_head, attack_owner_head, None, config, device)
-        row = {"epoch": epoch, "train": train_metrics, "validation": val_metrics}
+    epochs_without_improvement = 0
+    last_metrics: dict[str, float] | None = None
+    for epoch in range(start_epoch, train_cfg["max_epochs"]):
+        train_metrics = run_epoch(dataset, train_loader, encoder, mask_heads, relation_head, attack_owner_head, detail_head, optimizer, config, device)
+        should_eval = ((epoch + 1) % train_cfg["eval_every_epochs"] == 0) or (epoch + 1 == train_cfg["max_epochs"])
+        row: dict[str, Any] = {"epoch": epoch, "train": train_metrics}
+        if should_eval:
+            with torch.no_grad():
+                val_metrics = run_epoch(dataset, val_loader, encoder, mask_heads, relation_head, attack_owner_head, detail_head, None, config, device)
+            last_metrics = val_metrics
+            row["validation"] = val_metrics
+            current_val = val_metrics.get("total_loss", float("inf"))
+            improved = current_val < best_val
+            if improved:
+                best_val = current_val
+                epochs_without_improvement = 0
+                save_checkpoint(
+                    checkpoint_dir / "card_encoder_best.pt",
+                    encoder,
+                    mask_heads,
+                    relation_head,
+                    attack_owner_head,
+                    detail_head,
+                    optimizer,
+                    epoch,
+                    config,
+                    dataset.schema,
+                    val_metrics,
+                )
+            else:
+                epochs_without_improvement += 1
+            save_checkpoint(
+                checkpoint_dir / "card_encoder_last.pt",
+                encoder,
+                mask_heads,
+                relation_head,
+                attack_owner_head,
+                detail_head,
+                optimizer,
+                epoch,
+                config,
+                dataset.schema,
+                val_metrics,
+            )
+            if (
+                train_cfg["early_stopping_enabled"]
+                and (epoch + 1) >= train_cfg["min_epochs"]
+                and train_cfg["early_stopping_patience"] > 0
+                and epochs_without_improvement >= train_cfg["early_stopping_patience"]
+            ):
+                row["early_stopped"] = True
+                print(json.dumps(row, indent=2))
+                (log_dir / "card_pretrain_metrics.jsonl").open("a", encoding="utf-8").write(json.dumps(row) + "\n")
+                break
         print(json.dumps(row, indent=2))
         (log_dir / "card_pretrain_metrics.jsonl").open("a", encoding="utf-8").write(json.dumps(row) + "\n")
-        save_checkpoint(checkpoint_dir / "card_encoder_last.pt", encoder, mask_heads, relation_head, attack_owner_head, optimizer, epoch, config, dataset.schema, val_metrics)
-        if val_metrics.get("total_loss", float("inf")) < best_val:
-            best_val = val_metrics["total_loss"]
-            save_checkpoint(checkpoint_dir / "card_encoder_best.pt", encoder, mask_heads, relation_head, attack_owner_head, optimizer, epoch, config, dataset.schema, val_metrics)
+
+    if train_cfg["restore_best_checkpoint"] and (checkpoint_dir / "card_encoder_best.pt").exists():
+        checkpoint = torch.load(checkpoint_dir / "card_encoder_best.pt", map_location=device)
+        encoder.load_state_dict(checkpoint["encoder"])
+        mask_heads.load_state_dict(checkpoint["mask_heads"])
+        relation_head.load_state_dict(checkpoint["relation_head"])
+        attack_owner_head.load_state_dict(checkpoint["attack_owner_head"])
+        if "detail_head" in checkpoint:
+            detail_head.load_state_dict(checkpoint["detail_head"])
+        save_checkpoint(
+            checkpoint_dir / "card_encoder_last.pt",
+            encoder,
+            mask_heads,
+            relation_head,
+            attack_owner_head,
+            detail_head,
+            optimizer,
+            int(checkpoint.get("epoch", train_cfg["max_epochs"] - 1)),
+            config,
+            dataset.schema,
+            checkpoint.get("metrics", last_metrics or {}),
+        )
 
 
 if __name__ == "__main__":
