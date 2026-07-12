@@ -1,3 +1,5 @@
+> 历史资料：早期卡牌特征构想。当前正式设计见 `docs/ARCHITECTURE.md`。
+
 # Card feature extraction ideas
 
 This note is for the next training redesign. It focuses only on card-aware feature extraction and does not change the current Kaggle training code.

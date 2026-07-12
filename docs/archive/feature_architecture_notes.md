@@ -1,3 +1,5 @@
+> 历史资料：早期四类特征边界记录。当前正式设计见 `docs/ARCHITECTURE.md`。
+
 # Feature Architecture Notes
 
 Current decision snapshot for card-aware model feature construction.

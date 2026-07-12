@@ -1,3 +1,5 @@
+> 历史资料：旧 PPO、对手采样和失败运行记录。当前训练主线见 `docs/STATUS.md`。
+
 # Training ideas and concerns
 
 ## Privileged oracle teacher
@@ -141,4 +143,3 @@ Next checks before using this in training:
 3. Train/evaluate separate first-player and second-player policies or policy heads.
 4. Add turn-order conditioning to offline evaluation and report win rate separately for first/second.
 5. Avoid assuming second is better; treat this as a distribution-control opportunity that needs empirical validation.
-

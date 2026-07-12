@@ -1,3 +1,5 @@
+> 历史资料：这是动态状态模块启动时使用的完整 Codex 实现指令。当前项目入口与真实进度以根目录 `README.md`、`docs/ARCHITECTURE.md` 和 `docs/STATUS.md` 为准。
+
 # Codex 指令：从静态预处理基线实现动态实例与时序全局状态
 
 ## 0. 当前真实进度

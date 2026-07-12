@@ -1,6 +1,6 @@
 # State Feature Audit
 
-本文件对应 `codex_dynamic_temporal_state_from_static_baseline(1).md` 的第一步审计，用来固定静态 baseline、cabt observation 字段、可见性边界和后续动态状态实现入口。
+本文件记录静态 baseline、cabt observation 字段、可见性边界和动态状态实现入口。它是字段事实参考；当前架构与进度分别见 `docs/ARCHITECTURE.md` 和 `docs/STATUS.md`。
 
 ## 1. 静态卡牌 baseline
 
