@@ -1,21 +1,18 @@
 # Kaggle 工作流
 
-本项目在本地维护代码，在 Kaggle 完成公开 replay 提取、静态训练、动态 smoke 与最终提交构建。
+本项目在本地维护唯一正式源码，在 Kaggle 完成公开 replay 提取、静态 CardEncoder 训练以及后续动态/策略训练。
 
-## 1. 当前有效的 Kaggle 组件
+## 1. 当前组件
 
-| 目录 | 用途 | 状态 |
-|---|---|---|
-| `kaggle_extract/` | 提取公开 replay 与热门牌组 | 有效 |
-| `kaggle_card_pretrain/` | 训练与导出静态 CardEncoder | 已成功运行 |
-| `kaggle_cg_runtime_dataset/` | 向 kernel 提供 `cg` runtime | 有效，本地内容被 ignore |
-| `kaggle_dynamic_code_dataset/` | 发布动态数据与模型代码 | 有效部署镜像 |
-| `kaggle_dynamic_state_tests/` | 挂载 replay 进行动态 smoke | 原型验证入口 |
-| `kaggle_kernel/` | 旧一体化训练/提交 | 历史 baseline |
-| `kaggle_training/` | 旧规则特征与轻量 PPO | 历史 baseline |
-| `kaggle_submission/` | 旧 agent 提交构建 | 历史 baseline |
+| 目录 | 用途 |
+|---|---|
+| `kaggle_extract/` | 提取公开 replay 与热门牌组 |
+| `kaggle_card_pretrain/` | 训练并导出静态 CardEncoder |
+| `kaggle_cg_runtime/` | 构建自包含 `cg` runtime Dataset |
+| `kaggle_cg_runtime_dataset/` | `cg` runtime Dataset metadata；实际 `cg/` 本地生成 |
+| `kaggle_dynamic_code_dataset/` | 动态代码 Dataset metadata；代码从根源码生成 |
 
-当前模型主线从静态 artifacts 进入动态状态训练。旧 PPO 目录继续用于对照，不作为新模型入口。
+旧共享 PPO、旧 submission 和临时动态 smoke kernel 已从主分支移除。正式动态训练 kernel 将在 CardInstanceFusion 辅助任务实现后建立。
 
 ## 2. 提取热门牌组
 
@@ -34,33 +31,26 @@ popular_deck_outputs/popular_test_deck.csv
 popular_deck_outputs/popular_deck_summary.csv
 ```
 
-可用环境变量：
-
-```text
-PTCG_RECENT_SUBMISSIONS_TO_USE=8
-PTCG_MAX_REPLAYS_TO_DOWNLOAD=200
-PTCG_MIN_POPULAR_DECK_GAMES=2
-PTCG_MAX_POPULAR_DECKS=24
-PTCG_SUBMISSION_IDS="54449821 54449681"
-```
-
 ## 3. 静态 CardEncoder
 
-### 发布 `cg` runtime
+发布或更新 `cg` runtime Dataset：
 
 ```bash
-kaggle datasets create -p kaggle_cg_runtime_dataset --dir-mode zip
+kaggle kernels push -p kaggle_cg_runtime
+kaggle kernels output f7e6n5g4/ptcg-cg-runtime -p outputs/cg_runtime -o
+
+kaggle datasets version \
+  -p kaggle_cg_runtime_dataset \
+  --dir-mode zip \
+  -m "update cg runtime"
 ```
 
-已有 Dataset 更新：
+运行静态训练：
 
 ```bash
-kaggle datasets version -p kaggle_cg_runtime_dataset --dir-mode zip -m "update cg runtime"
-```
+python scripts/build_kaggle_card_pretrain_kernel.py
+python scripts/build_kaggle_card_pretrain_kernel.py --check
 
-### 运行静态训练
-
-```bash
 kaggle kernels push -p kaggle_card_pretrain
 kaggle kernels status f7e6n5g4/ptcg-card-pretrain
 kaggle kernels output f7e6n5g4/ptcg-card-pretrain -p outputs/card_pretrain -o
@@ -80,36 +70,53 @@ outputs/card_pretrain/checkpoints/card_encoder_last.pt
 outputs/card_pretrain/logs/card_pretrain_metrics.jsonl
 ```
 
-后续模块按 Card ID 读取 summary/detail，不重新解析静态 CSV 行数作为卡牌副本数。
+## 4. Replay 导入与审计
 
-## 4. 动态 replay smoke
-
-动态 kernel 使用三类输入：
-
-1. `ptcg-dynamic-code-dataset`
-2. Kaggle episode index
-3. 少量按日期挂载的 replay Dataset
-
-更新代码 Dataset：
+从已挂载的每日 replay Dataset 生成 decision index：
 
 ```bash
+python scripts/import_online_replay_decisions.py \
+  --episodes-index-dir /kaggle/input/pokemon-tcg-ai-battle-episodes-index \
+  --use-daily-manifest \
+  --daily-dataset-mount-root /kaggle/input \
+  --reserve-recent-days 3 \
+  --import-split train \
+  --max-days 1 \
+  --max-samples 4096 \
+  --output-dir outputs/replay_decisions
+```
+
+审计模型实际会读取的决策点：
+
+```bash
+python scripts/audit_replay_features.py \
+  /kaggle/input/pokemon-tcg-ai-battle-episodes-2026-07-07 \
+  --max-samples 4096 \
+  --static-id-map outputs/card_pretrain/artifacts/card_id_to_index.json \
+  --output outputs/replay_feature_audit.json
+```
+
+最近日期作为 reserved split。首次运行保持少量日期与样本，先确认 parser error、Card ID 覆盖率、实例数、事件数和 option 数分布。
+
+## 5. 生成动态代码 Dataset
+
+Kaggle Dataset 中的 `data/`、`models/` 和 `scripts/` 不在 Git 中维护第二份副本。发布前生成：
+
+```bash
+python scripts/sync_kaggle_dynamic_code_dataset.py
 kaggle datasets version \
   -p kaggle_dynamic_code_dataset \
   --dir-mode zip \
-  -m "update dynamic state code"
+  -m "sync dynamic source"
 ```
 
-运行：
+检查现有生成内容是否与根源码一致：
 
 ```bash
-kaggle kernels push -p kaggle_dynamic_state_tests
-kaggle kernels status f7e6n5g4/ptcg-dynamic-state-tests
-kaggle kernels output f7e6n5g4/ptcg-dynamic-state-tests -p outputs/dynamic_state_tests -o
+python scripts/sync_kaggle_dynamic_code_dataset.py --check
 ```
 
-`kaggle_dynamic_state_tests/run_dynamic_code_dataset_entry.py` 当前只读取一个早期训练日期并保留最近日期作为时间验证。首次检查保持有限数据规模，确认字段分布后再增加日期和样本数。
-
-## 5. 本地辅助命令
+## 6. 本地辅助命令
 
 重新生成 baseline decks：
 
@@ -117,39 +124,21 @@ kaggle kernels output f7e6n5g4/ptcg-dynamic-state-tests -p outputs/dynamic_state
 python scripts/make_baseline_decks.py
 ```
 
-状态 benchmark：
+状态编码 benchmark：
 
 ```bash
 python scripts/benchmark_dynamic_state.py --iterations 100
 ```
 
-本地 replay decision dataset：
+静态 energy-type probe：
 
 ```bash
-python scripts/build_replay_decision_dataset.py \
-  --replay-path data_from_submission/replays \
-  --output-dir data_from_submission/replay_dataset
+python scripts/linear_probe_energy_type.py
 ```
 
-## 6. 旧 Agent 与提交
+## 7. 未来正式提交
 
-旧链路仍可生成 baseline submission：
-
-```bash
-kaggle kernels push -p kaggle_training
-kaggle kernels output f7e6n5g4/ptcg-agent-training -p outputs -o
-
-kaggle kernels push -p kaggle_submission
-kaggle kernels output f7e6n5g4/ptcg-agent-submission -p outputs/submission -o
-```
-
-该链路输出 `model.json`、`ppo_weights.json`、`policy_state.pt` 和 `submission.tar.gz`，与当前静态/动态主线 checkpoint 不兼容。
-
-未来正式提交入口将在 ActionEncoder、行为克隆和 self-play 完成后重新建立。
-
-## 7. 比赛提交要求
-
-提交包顶层必须包含：
+ActionEncoder、行为克隆、Value 和 self-play 完成后，再建立唯一 submission kernel。提交包顶层需要包含：
 
 ```text
 main.py
@@ -157,13 +146,4 @@ deck.csv
 模型权重与运行所需文件
 ```
 
-构建后提交：
-
-```bash
-kaggle competitions submit \
-  -c pokemon-tcg-ai-battle \
-  -f outputs/submission/submission.tar.gz \
-  -m "message"
-```
-
-运行路径为 `/kaggle_simulations/agent/`，提交包大小上限为 197.7 MiB。正式打包前需要验证 self-play validation、相对导入路径、CPU 延迟和内存占用。
+运行路径为 `/kaggle_simulations/agent/`，提交包大小上限为 197.7 MiB。打包前验证 self-play validation、相对导入路径、CPU 延迟和内存占用。

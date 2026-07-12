@@ -12,13 +12,10 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DECKS_MD = ROOT / "decks.md"
-OUTPUT_JSON = ROOT / "baseline_decks.json"
-OUTPUT_MD = ROOT / "baseline_decks.md"
-KAGGLE_DECK_DIRS = [
-    ROOT / "kaggle_training",
-    ROOT / "kaggle_submission",
-]
+DECK_DIR = ROOT / "decks"
+DECKS_MD = DECK_DIR / "source_decks.txt"
+OUTPUT_JSON = DECK_DIR / "baseline_decks.json"
+OUTPUT_MD = DECK_DIR / "baseline_decks.md"
 
 
 SECTION_NAMES = {"Pokémon", "Pokemon", "Trainer", "Energy"}
@@ -99,7 +96,9 @@ def parse_decks(text: str) -> list[dict[str, Any]]:
 def load_engine_cards() -> list[Any]:
     cg_parent = ROOT / "outputs"
     if not (cg_parent / "cg" / "api.py").exists():
-        raise FileNotFoundError("outputs/cg/api.py not found; run train_agent.py once to extract cg runtime")
+        raise FileNotFoundError(
+            "outputs/cg/api.py not found; download or extract the cg runtime into outputs/cg first"
+        )
     sys.path.insert(0, str(cg_parent))
     from cg.api import all_card_data
 
@@ -290,32 +289,10 @@ def main() -> None:
         )
 
     OUTPUT_JSON.write_text(json.dumps(output, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    for deck_dir in KAGGLE_DECK_DIRS:
-        deck_dir.mkdir(parents=True, exist_ok=True)
-        (deck_dir / "baseline_decks.json").write_text(
-            json.dumps(output, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-
-    full_decks = [
-        deck
-        for deck in output["decks"]
-        if deck["missing_total"] == 0 and deck["deck_ids_if_all_present"]
-    ]
-    patched_decks = [deck for deck in output["decks"] if deck["patched_deck_ids"]]
-    selected_deck = patched_decks[0] if patched_decks else (full_decks[0] if full_decks else None)
-    if selected_deck is not None:
-        deck_ids = selected_deck["patched_deck_ids"] or selected_deck["deck_ids_if_all_present"]
-        for deck_dir in KAGGLE_DECK_DIRS:
-            (deck_dir / "baseline_deck.csv").write_text(
-                "\n".join(str(card_id) for card_id in deck_ids) + "\n",
-                encoding="utf-8",
-            )
-
     lines = [
         "# Baseline decks card-pool match",
         "",
-        f"Source: `{DECKS_MD.name}`",
+        f"Source: `decks/{DECKS_MD.name}`",
         f"Card pool: `cg.api.all_card_data()` ({len(engine_cards)} unique cards)",
         "",
     ]
@@ -370,11 +347,6 @@ def main() -> None:
     OUTPUT_MD.write_text("\n".join(lines), encoding="utf-8")
     print(f"Wrote {OUTPUT_JSON}")
     print(f"Wrote {OUTPUT_MD}")
-    for deck_dir in KAGGLE_DECK_DIRS:
-        print(f"Wrote {deck_dir / 'baseline_decks.json'}")
-    if selected_deck is not None:
-        for deck_dir in KAGGLE_DECK_DIRS:
-            print(f"Wrote {deck_dir / 'baseline_deck.csv'} from {selected_deck['name']}")
 
 
 if __name__ == "__main__":

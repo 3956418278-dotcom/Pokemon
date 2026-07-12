@@ -76,26 +76,23 @@ flowchart TD
 ```text
 configs/                     静态训练配置
 data/                        卡牌预处理、observation/replay 数据结构与解析
+decks/                       原始牌组、Card ID 匹配结果与 baseline 牌组
 models/                      CardEncoder、动态实例、融合与 Board 模型
 training/                    静态 CardEncoder 训练、导出和评估
 scripts/                     数据审计、牌组构造、benchmark 与 Kaggle 辅助脚本
 tests/                       静态、动态、replay 和可见性测试
 
 kaggle_card_pretrain/        静态 CardEncoder 训练 kernel
-kaggle_dynamic_code_dataset/ 动态代码的 Kaggle Dataset 部署镜像
-kaggle_dynamic_state_tests/  动态 replay smoke kernel
+kaggle_cg_runtime/           构建 cg runtime Dataset 的自包含 kernel
+kaggle_cg_runtime_dataset/   cg runtime Dataset metadata
+kaggle_dynamic_code_dataset/ 动态代码 Dataset metadata；代码由同步脚本生成
 kaggle_extract/              公开 replay 与热门牌组提取 kernel
-
-kaggle_kernel/               旧一体化 agent 链路
-kaggle_training/             旧 PPO 训练链路
-kaggle_submission/           旧 submission 链路
 
 docs/                        当前文档
 docs/reference/              字段审计与事实资料
-docs/archive/                历史方案、旧指令和失败记录
 ```
 
-正式源码位于根目录的 `data/`、`models/`、`training/` 和 `scripts/`。`kaggle_dynamic_code_dataset/` 是部署镜像，不作为第二份独立实现维护。
+正式源码位于根目录的 `data/`、`models/`、`training/` 和 `scripts/`。运行 `scripts/sync_kaggle_dynamic_code_dataset.py` 时，才会从正式源码生成 Kaggle 动态代码 Dataset；生成目录不提交 Git。
 
 ## 本地与忽略文件
 
@@ -113,8 +110,8 @@ docs/archive/                历史方案、旧指令和失败记录
 - [架构说明](docs/ARCHITECTURE.md)：模型各层、可见性边界和训练顺序。
 - [项目状态](docs/STATUS.md)：已完成内容、真实缺口和下一步。
 - [Kaggle 工作流](docs/KAGGLE_WORKFLOW.md)：数据集、kernel、训练与产物下载。
+- [实验结论](docs/EXPERIMENT_HISTORY.md)：旧 PPO 失败原因、先后手观察和 oracle 方向。
 - [状态字段审计](docs/reference/state_feature_audit.md)：`cabt` 字段、枚举和隐藏信息边界。
-- `docs/archive/`：历史想法、旧 PPO 记录和曾使用的 Codex 实现指令。
 
 ## 常用入口
 

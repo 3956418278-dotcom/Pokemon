@@ -43,6 +43,9 @@ kaggle_card_pretrain/data/
 kaggle_card_pretrain/models/
 kaggle_card_pretrain/training/
 kaggle_card_pretrain/configs/
+kaggle_dynamic_code_dataset/data/
+kaggle_dynamic_code_dataset/models/
+kaggle_dynamic_code_dataset/scripts/
 
 # Collaboration/local agent state
 .agents/

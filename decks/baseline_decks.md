@@ -1,6 +1,6 @@
 # Baseline decks card-pool match
 
-Source: `decks.md`
+Source: `decks/source_decks.txt`
 Card pool: `cg.api.all_card_data()` (1267 unique cards)
 
 ## Dragapult

@@ -76,7 +76,7 @@
 - Oracle teacher / student distillation
 - Self-play PPO
 
-`kaggle_kernel/`、`kaggle_training/` 和 `kaggle_submission/` 中存在旧规则特征与轻量 PPO baseline。它们用于历史对照，不代表当前模型主线。
+旧规则特征与共享 PPO 代码已经从当前仓库移除。失败原因和仍有价值的结论保存在 [实验结论记录](EXPERIMENT_HISTORY.md)，完整旧实现可从 Git 历史读取。
 
 ## 接下来的完整顺序
 
@@ -107,3 +107,10 @@
 → self-play
 → submission
 ```
+
+## 仓库清理结果
+
+- 当前仓库只保留静态训练、动态状态、replay 数据和未来策略需要的正式源码。
+- Kaggle 动态代码副本改为由 `scripts/sync_kaggle_dynamic_code_dataset.py` 生成。
+- 旧 PPO 三套重复目录、临时动态 smoke 训练、旧 CardInstanceEncoder 和 replay notebook 已移除。
+- 牌组资料统一放在 `decks/`。

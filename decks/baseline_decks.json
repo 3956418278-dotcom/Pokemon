@@ -1,5 +1,5 @@
 {
-  "source": "decks.md",
+  "source": "decks/source_decks.txt",
   "card_pool": {
     "source": "cg.api.all_card_data",
     "unique_cards": 1267
