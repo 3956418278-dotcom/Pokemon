@@ -45,7 +45,7 @@
 | 静态卡牌预处理 | 完成 | 同一 Card ID 聚合为一张卡，多攻击/特性保持独立 detail |
 | 静态 CardEncoder | 完成 | 1267 张卡；128 维 summary 与逐 detail token 已训练并导出 |
 | Observation / replay 解析 | 初版完成 | 支持变长 replay、公开性边界和 decision sample 构造 |
-| 动态单卡表示 | 原型 | 已有字段提取和前向接口，正式动态条件 Cross-Attention 与辅助训练待完成 |
+| 动态单卡表示 | 云端验证中 | 结构化字段、四头动态 Cross-Attention、四项辅助任务和正式训练入口已实现；真实多日训练产物待 Kaggle 回收 |
 | Ledger / Recent Events | 原型 | 已有最小记忆接口，正式长期认知与幂等更新待完成 |
 | Board Transformer | 原型 | 可完成 smoke forward，尚无正式动态 checkpoint |
 | ActionEncoder / 行为克隆 / Value / PPO | 尚未进入主线 | 旧 PPO 代码仅作为历史 baseline |
@@ -86,6 +86,7 @@ kaggle_card_pretrain/        静态 CardEncoder 训练 kernel
 kaggle_cg_runtime/           构建 cg runtime Dataset 的自包含 kernel
 kaggle_cg_runtime_dataset/   cg runtime Dataset metadata
 kaggle_dynamic_code_dataset/ 动态代码 Dataset metadata；代码由同步脚本生成
+kaggle_dynamic_training/     唯一正式动态单卡训练 Kernel
 kaggle_extract/              公开 replay 与热门牌组提取 kernel
 
 docs/                        当前文档

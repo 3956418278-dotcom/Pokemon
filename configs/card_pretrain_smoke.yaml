@@ -1,0 +1,59 @@
+schema_version: static_card_training_v2
+run_mode: static_v2_smoke
+seed: 20260713
+
+data:
+  cache_dir: artifacts/card_data_v2
+  validation_ratio: 0.15
+  test_ratio: 0.15
+  split_mode: card_id
+
+model:
+  embedding_dim: 128
+  detail_token_dim: 128
+  attention_heads: 4
+  transformer_layers: 2
+  ffn_dim: 256
+  dropout: 0.0
+
+training:
+  batch_size: 32
+  relation_batch_size: 64
+  max_epochs: 0
+  min_epochs: 0
+  eval_every_epochs: 1
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-4
+  checkpoint_dir: outputs/static_v2_smoke/formal_checkpoints_disabled
+  log_dir: outputs/static_v2_smoke/formal_logs_disabled
+  device: cuda
+  early_stopping:
+    enabled: false
+    patience: 0
+    restore_best_checkpoint: false
+  masking:
+    categorical_probability: 0.10
+    numeric_probability: 0.10
+    rule_probability: 0.10
+    text_token_probability: 0.15
+    detail_field_probability: 0.10
+
+tasks:
+  identity_relation_masking: true
+  leave_one_detail_out: true
+  hard_negative_same_type: true
+
+loss_weights:
+  card_fields: 1.0
+  detail_fields: 1.0
+  text_mlm: 1.0
+  ownership: 1.0
+  relation: 1.0
+
+tiny_overfit:
+  enabled: true
+  card_count: 32
+  steps: 300
+  learning_rate: 1.0e-3
+  required_loss_ratio: 0.20
+  fixed_masks: true

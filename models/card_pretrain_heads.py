@@ -9,243 +9,281 @@ import torch.nn.functional as F
 from .card_encoder import infer_head_sizes
 
 
-class MaskedFieldHeads(nn.Module):
+def _zero(reference: torch.Tensor) -> torch.Tensor:
+    return reference.sum() * 0.0
+
+
+def _accuracy(logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
+    valid = mask.bool()
+    if not bool(valid.any().item()):
+        return 0.0
+    return float((logits[valid].argmax(dim=-1) == target[valid]).float().mean().detach().cpu())
+
+
+class CardFieldRecoveryHeads(nn.Module):
+    """Recover grouped card fields; exact card name is intentionally absent."""
+
     def __init__(self, schema: dict[str, Any], embedding_dim: int = 128) -> None:
         super().__init__()
         sizes = infer_head_sizes(schema)
-        self.card_type = nn.Linear(embedding_dim, sizes["card_type"])
-        self.pokemon_type = nn.Linear(embedding_dim, sizes["pokemon_type"])
-        self.stage = nn.Linear(embedding_dim, sizes["stage"])
-        self.trainer_type = nn.Linear(embedding_dim, sizes["trainer_type"])
-        self.energy_type = nn.Linear(embedding_dim, sizes["energy_type"])
-        self.hp = nn.Linear(embedding_dim, 1)
-        self.retreat = nn.Linear(embedding_dim, 6)
-        self.energy_cost = nn.Linear(embedding_dim, 1)
-        self.damage = nn.Linear(embedding_dim, 1)
+        self.fields = tuple(schema["card_field_slots"])
+        self.field_heads = nn.ModuleDict(
+            {field: nn.Linear(embedding_dim, size) for field, size in sizes["card_fields"].items()}
+        )
+        energy_count_classes = int(sizes["profile_energy_count"])
+        self.energy_count_heads = nn.ModuleList(
+            [nn.Linear(embedding_dim, energy_count_classes) for _ in schema["energy_symbols"]]
+        )
 
-    def forward(self, embedding: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, card_summary: torch.Tensor) -> dict[str, Any]:
         return {
-            "card_type": self.card_type(embedding),
-            "pokemon_type": self.pokemon_type(embedding),
-            "stage": self.stage(embedding),
-            "trainer_type": self.trainer_type(embedding),
-            "energy_type": self.energy_type(embedding),
-            "hp": self.hp(embedding).squeeze(-1),
-            "retreat": self.retreat(embedding),
-            "energy_cost": self.energy_cost(embedding).squeeze(-1),
-            "damage": self.damage(embedding).squeeze(-1),
+            "fields": {field: head(card_summary) for field, head in self.field_heads.items()},
+            "energy_counts": torch.stack([head(card_summary) for head in self.energy_count_heads], dim=1),
         }
 
 
-class RelationHead(nn.Module):
-    def __init__(self, embedding_dim: int = 128, relation_types: int = 4) -> None:
-        super().__init__()
-        self.relation_type = nn.Embedding(relation_types, 16)
-        self.net = nn.Sequential(
-            nn.Linear(embedding_dim * 4 + 16, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+def card_field_recovery_loss(
+    predictions: dict[str, Any],
+    batch: dict[str, torch.Tensor],
+    field_masks: dict[str, torch.Tensor],
+    field_slots: tuple[str, ...],
+) -> tuple[torch.Tensor, dict[str, float], int]:
+    field_indices = {field: index for index, field in enumerate(field_slots)}
+    applicability = batch["card_field_applicability_mask"].bool()
+    total_sum: torch.Tensor | None = None
+    total_count = 0
+    metrics: dict[str, float] = {}
+    for field, logits in predictions["fields"].items():
+        mask = field_masks.get(field)
+        if not isinstance(mask, torch.Tensor):
+            continue
+        valid = mask.bool() & applicability[:, field_indices[field]]
+        if not bool(valid.any().item()):
+            continue
+        target = batch["card_field_value_ids"][:, field_indices[field]].long()
+        loss_sum = F.cross_entropy(logits[valid], target[valid], reduction="sum")
+        total_sum = loss_sum if total_sum is None else total_sum + loss_sum
+        count = int(valid.sum().item())
+        total_count += count
+        metrics[f"{field}_accuracy"] = _accuracy(logits, target, valid)
+        metrics[f"{field}_count"] = float(count)
 
-    def forward(self, left: torch.Tensor, right: torch.Tensor, relation_type: torch.Tensor) -> torch.Tensor:
-        rel = self.relation_type(relation_type)
-        features = torch.cat([left, right, torch.abs(left - right), left * right, rel], dim=-1)
-        return self.net(features).squeeze(-1)
+    energy_mask = field_masks.get("energy_printed_type")
+    if isinstance(energy_mask, torch.Tensor):
+        valid_cards = energy_mask.bool() & applicability[:, field_indices["energy_printed_type"]]
+        energy_logits = predictions["energy_counts"]
+        energy_target = batch["provided_energy_count_ids"].long()
+        for symbol_index in range(energy_logits.shape[1]):
+            if not bool(valid_cards.any().item()):
+                continue
+            logits = energy_logits[:, symbol_index]
+            target = energy_target[:, symbol_index]
+            loss_sum = F.cross_entropy(logits[valid_cards], target[valid_cards], reduction="sum")
+            total_sum = loss_sum if total_sum is None else total_sum + loss_sum
+            count = int(valid_cards.sum().item())
+            total_count += count
+            metrics[f"energy_symbol_{symbol_index}_accuracy"] = _accuracy(logits, target, valid_cards)
+            metrics[f"energy_symbol_{symbol_index}_count"] = float(count)
+
+    reference = predictions["energy_counts"]
+    loss = _zero(reference) if total_sum is None else total_sum / max(1, total_count)
+    metrics["valid_prediction_count"] = float(total_count)
+    metrics["loss"] = float(loss.detach().cpu())
+    return loss, metrics, total_count
 
 
-class AttackOwnerHead(nn.Module):
-    def __init__(self, embedding_dim: int = 128, attack_feature_dim: int = 16) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embedding_dim + attack_feature_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-        )
+class DetailAttributeHeads(nn.Module):
+    """Recover discrete cost counts and damage from complete independent details."""
 
-    def forward(self, card_embedding: torch.Tensor, attack_features: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([card_embedding, attack_features], dim=-1)).squeeze(-1)
-
-
-class DetailPredictionHead(nn.Module):
     def __init__(self, schema: dict[str, Any], detail_dim: int = 128) -> None:
         super().__init__()
         sizes = infer_head_sizes(schema)
-        self.detail_type = nn.Linear(detail_dim, sizes["detail_type"])
-        self.attack_energy = nn.Linear(detail_dim, 12)
-        self.attack_total_energy = nn.Linear(detail_dim, 1)
-        self.attack_damage = nn.Linear(detail_dim, 1)
-        self.attack_damage_mode = nn.Linear(detail_dim, sizes["damage_mode"])
-        self.effect_source_type = nn.Linear(detail_dim, sizes["effect_source_type"])
+        self.cost_heads = nn.ModuleList(
+            [nn.Linear(detail_dim, int(sizes["attack_energy_count"])) for _ in schema["attack_energy_symbols"]]
+        )
+        self.damage_value = nn.Linear(detail_dim, int(sizes["damage_value"]))
+        self.damage_mode = nn.Linear(detail_dim, int(sizes["damage_mode"]))
 
     def forward(self, detail_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
         return {
-            "detail_type": self.detail_type(detail_tokens),
-            "attack_energy": self.attack_energy(detail_tokens),
-            "attack_total_energy": self.attack_total_energy(detail_tokens).squeeze(-1),
-            "attack_damage": self.attack_damage(detail_tokens).squeeze(-1),
-            "attack_damage_mode": self.attack_damage_mode(detail_tokens),
-            "effect_source_type": self.effect_source_type(detail_tokens),
+            "cost_counts": torch.stack([head(detail_tokens) for head in self.cost_heads], dim=2),
+            "damage_value": self.damage_value(detail_tokens),
+            "damage_mode": self.damage_mode(detail_tokens),
         }
 
 
-def info_nce_loss(text_embedding: torch.Tensor, structure_embedding: torch.Tensor, temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
-    logits = text_embedding @ structure_embedding.t() / max(temperature, 1e-6)
-    target = torch.arange(logits.size(0), device=logits.device)
-    loss_ts = F.cross_entropy(logits, target)
-    loss_st = F.cross_entropy(logits.t(), target)
-    top1_ts = (logits.argmax(dim=1) == target).float().mean().item()
-    top1_st = (logits.argmax(dim=0) == target).float().mean().item()
-    return (loss_ts + loss_st) * 0.5, {
-        "text_to_structure_top1": top1_ts,
-        "structure_to_text_top1": top1_st,
-    }
-
-
-def safe_cross_entropy(logits: torch.Tensor, target: torch.Tensor, ignore_index: int | None = None) -> torch.Tensor:
-    if ignore_index is not None and bool((target != ignore_index).sum().item() == 0):
-        return logits.sum() * 0.0
-    if ignore_index is None:
-        return F.cross_entropy(logits, target)
-    return F.cross_entropy(logits, target, ignore_index=ignore_index)
-
-
-def masked_field_loss(pred: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
-    losses = {
-        "card_type": safe_cross_entropy(pred["card_type"], batch["card_type_target"]),
-        "pokemon_type": safe_cross_entropy(pred["pokemon_type"], batch["pokemon_type_target"], ignore_index=-100),
-        "stage": safe_cross_entropy(pred["stage"], batch["stage_target"], ignore_index=-100),
-        "trainer_type": safe_cross_entropy(pred["trainer_type"], batch["trainer_type_target"], ignore_index=-100),
-        "energy_type": safe_cross_entropy(pred["energy_type"], batch["energy_type_target"], ignore_index=-100),
-        "hp": F.smooth_l1_loss(pred["hp"], batch["hp_target"]),
-        "retreat": F.cross_entropy(pred["retreat"], batch["retreat_target"]),
-        "energy_cost": F.smooth_l1_loss(pred["energy_cost"], batch["energy_cost_target"]),
-        "damage": F.smooth_l1_loss(pred["damage"], batch["damage_target"]),
-    }
-    total = sum(losses.values()) / len(losses)
-    metrics: dict[str, float] = {f"mask_{name}_loss": float(value.detach().cpu()) for name, value in losses.items()}
-    metrics["mask_card_type_acc"] = float((pred["card_type"].argmax(dim=1) == batch["card_type_target"]).float().mean().detach().cpu())
-    metrics["mask_retreat_acc"] = float((pred["retreat"].argmax(dim=1) == batch["retreat_target"]).float().mean().detach().cpu())
-    valid_energy = batch["energy_type_target"] != -100
-    if bool(valid_energy.any().item()):
-        metrics["mask_energy_type_acc"] = float(
-            (pred["energy_type"].argmax(dim=1)[valid_energy] == batch["energy_type_target"][valid_energy])
-            .float()
-            .mean()
-            .detach()
-            .cpu()
-        )
-    return total, metrics
-
-
-def detail_prediction_loss(
-    pred: dict[str, torch.Tensor],
-    detail_mask: torch.Tensor,
-    detail_type_ids: torch.Tensor,
+def detail_attribute_loss(
+    predictions: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
-) -> tuple[torch.Tensor, dict[str, float]]:
-    valid = detail_mask > 0
-    losses: dict[str, torch.Tensor] = {}
+) -> tuple[torch.Tensor, dict[str, float], int]:
+    valid = batch["detail_mask"].bool() & batch["attack_mask"].bool()
+    total_sum: torch.Tensor | None = None
+    total_count = 0
+    metrics: dict[str, float] = {}
+    cost_logits = predictions["cost_counts"]
+    cost_target = batch["attack_energy_count_ids"].long()
+    for symbol_index in range(cost_logits.shape[2]):
+        logits = cost_logits[:, :, symbol_index]
+        target = cost_target[:, :, symbol_index]
+        if bool(valid.any().item()):
+            loss_sum = F.cross_entropy(logits[valid], target[valid], reduction="sum")
+            total_sum = loss_sum if total_sum is None else total_sum + loss_sum
+            count = int(valid.sum().item())
+            total_count += count
+            metrics[f"cost_symbol_{symbol_index}_accuracy"] = _accuracy(logits, target, valid)
+
+    for name, target_name in (
+        ("damage_value", "attack_damage_value_ids"),
+        ("damage_mode", "attack_damage_mode_ids"),
+    ):
+        logits = predictions[name]
+        target = batch[target_name].long()
+        if bool(valid.any().item()):
+            loss_sum = F.cross_entropy(logits[valid], target[valid], reduction="sum")
+            total_sum = loss_sum if total_sum is None else total_sum + loss_sum
+            count = int(valid.sum().item())
+            total_count += count
+            metrics[f"{name}_accuracy"] = _accuracy(logits, target, valid)
+
+    reference = predictions["damage_mode"]
+    loss = _zero(reference) if total_sum is None else total_sum / max(1, total_count)
     if bool(valid.any().item()):
-        losses["detail_type"] = F.cross_entropy(pred["detail_type"][valid], detail_type_ids[valid])
-    else:
-        losses["detail_type"] = pred["detail_type"].sum() * 0.0
+        exact = torch.ones_like(valid)
+        for symbol_index in range(cost_logits.shape[2]):
+            exact &= cost_logits[:, :, symbol_index].argmax(dim=-1) == cost_target[:, :, symbol_index]
+        metrics["cost_exact_vector_accuracy"] = float(exact[valid].float().mean().detach().cpu())
+        nonzero = valid.unsqueeze(-1) & (cost_target > 0)
+        if bool(nonzero.any().item()):
+            predicted = cost_logits.argmax(dim=-1)
+            metrics["cost_nonzero_accuracy"] = float((predicted[nonzero] == cost_target[nonzero]).float().mean().detach().cpu())
+    metrics["valid_prediction_count"] = float(total_count)
+    metrics["loss"] = float(loss.detach().cpu())
+    return loss, metrics, total_count
 
-    attack_count = batch["attack_mask"].size(1)
-    ability_count = batch["ability_mask"].size(1)
-    attack_mask = batch["attack_mask"] > 0
-    if bool(attack_mask.any().item()):
-        attack_slice = slice(0, attack_count)
-        losses["attack_energy"] = F.smooth_l1_loss(
-            pred["attack_energy"][:, attack_slice][attack_mask],
-            batch["attack_energy_counts"][attack_mask],
-        )
-        losses["attack_total_energy"] = F.smooth_l1_loss(
-            pred["attack_total_energy"][:, attack_slice][attack_mask],
-            batch["attack_total_energy_cost"][attack_mask],
-        )
-        damage_mask = attack_mask & (batch["attack_damage_mask"] > 0)
-        if bool(damage_mask.any().item()):
-            losses["attack_damage"] = F.smooth_l1_loss(
-                pred["attack_damage"][:, attack_slice][damage_mask],
-                batch["attack_damage"][damage_mask],
-            )
-        else:
-            losses["attack_damage"] = pred["attack_damage"].sum() * 0.0
-        losses["attack_damage_mode"] = F.cross_entropy(
-            pred["attack_damage_mode"][:, attack_slice][attack_mask],
-            batch["attack_damage_mode"][attack_mask],
-        )
-    else:
-        zero = pred["attack_energy"].sum() * 0.0
-        losses["attack_energy"] = zero
-        losses["attack_total_energy"] = zero
-        losses["attack_damage"] = zero
-        losses["attack_damage_mode"] = zero
 
-    effect_start = attack_count + ability_count
-    effect_mask = batch["effect_mask"] > 0
-    if bool(effect_mask.any().item()):
-        losses["effect_source_type"] = F.cross_entropy(
-            pred["effect_source_type"][:, effect_start:][effect_mask],
-            batch["effect_source_type"][effect_mask],
-        )
-    else:
-        losses["effect_source_type"] = pred["effect_source_type"].sum() * 0.0
+class TextMLMHead(nn.Module):
+    def __init__(self, schema: dict[str, Any], hidden_dim: int = 128) -> None:
+        super().__init__()
+        self.projection = nn.Linear(hidden_dim, int(infer_head_sizes(schema)["text"]))
 
-    total = sum(losses.values()) / len(losses)
-    metrics = {f"detail_{name}_loss": float(value.detach().cpu()) for name, value in losses.items()}
+    def forward(self, token_states: torch.Tensor) -> torch.Tensor:
+        return self.projection(token_states)
+
+
+def text_mlm_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float], int]:
+    valid = mask.bool()
+    count = int(valid.sum().item())
+    if count == 0:
+        loss = _zero(logits)
+        return loss, {"accuracy": 0.0, "perplexity": 1.0, "valid_prediction_count": 0.0, "loss": 0.0}, 0
+    loss = F.cross_entropy(logits[valid], labels.long()[valid])
+    return loss, {
+        "accuracy": _accuracy(logits, labels.long(), valid),
+        "perplexity": float(torch.exp(loss.detach().clamp(max=20)).cpu()),
+        "valid_prediction_count": float(count),
+        "loss": float(loss.detach().cpu()),
+    }, count
+
+
+class StructureReferenceHeads(nn.Module):
+    """Recover a fully masked structure-reference unit."""
+
+    def __init__(self, schema: dict[str, Any], hidden_dim: int = 128) -> None:
+        super().__init__()
+        sizes = infer_head_sizes(schema)
+        self.reference_type = nn.Linear(hidden_dim, int(sizes["reference_type"]))
+        self.reference_values = nn.ModuleDict(
+            {field: nn.Linear(hidden_dim, int(size)) for field, size in sizes["reference_values"].items()}
+        )
+
+    def forward(self, token_states: torch.Tensor) -> dict[str, Any]:
+        return {
+            "reference_type": self.reference_type(token_states),
+            "reference_values": {
+                field: head(token_states) for field, head in self.reference_values.items()
+            },
+        }
+
+
+def structure_reference_loss(
+    predictions: dict[str, Any],
+    type_labels: torch.Tensor,
+    field_labels: torch.Tensor,
+    value_labels: torch.Tensor,
+    mask: torch.Tensor,
+    reference_fields: tuple[str, ...],
+) -> tuple[torch.Tensor, dict[str, float], int]:
+    valid = mask.bool()
+    total_sum: torch.Tensor | None = None
+    total_count = 0
+    metrics: dict[str, float] = {}
+    type_logits = predictions["reference_type"]
     if bool(valid.any().item()):
-        metrics["detail_type_acc"] = float((pred["detail_type"][valid].argmax(dim=-1) == detail_type_ids[valid]).float().mean().detach().cpu())
-    if bool(attack_mask.any().item()):
-        metrics["detail_attack_damage_mode_acc"] = float(
-            (
-                pred["attack_damage_mode"][:, :attack_count][attack_mask].argmax(dim=-1)
-                == batch["attack_damage_mode"][attack_mask]
-            )
-            .float()
-            .mean()
-            .detach()
-            .cpu()
-        )
-        metrics["detail_attack_energy_mae"] = float(
-            (pred["attack_energy"][:, :attack_count][attack_mask] - batch["attack_energy_counts"][attack_mask])
-            .abs()
-            .mean()
-            .detach()
-            .cpu()
-        )
-    return total, metrics
+        type_sum = F.cross_entropy(type_logits[valid], type_labels.long()[valid], reduction="sum")
+        total_sum = type_sum
+        total_count = int(valid.sum().item())
+        metrics["reference_type_accuracy"] = _accuracy(type_logits, type_labels.long(), valid)
+    for field_index, field in enumerate(reference_fields, start=1):
+        field_valid = valid & (field_labels.long() == field_index)
+        if not bool(field_valid.any().item()):
+            continue
+        logits = predictions["reference_values"][field]
+        loss_sum = F.cross_entropy(logits[field_valid], value_labels.long()[field_valid], reduction="sum")
+        total_sum = loss_sum if total_sum is None else total_sum + loss_sum
+        count = int(field_valid.sum().item())
+        total_count += count
+        metrics[f"{field}_accuracy"] = _accuracy(logits, value_labels.long(), field_valid)
+        metrics[f"{field}_count"] = float(count)
+    loss = _zero(type_logits) if total_sum is None else total_sum / max(1, total_count)
+    metrics["valid_prediction_count"] = float(total_count)
+    metrics["loss"] = float(loss.detach().cpu())
+    return loss, metrics, total_count
 
 
-def energy_separation_loss(embedding: torch.Tensor, labels: torch.Tensor, margin: float = 0.25) -> torch.Tensor:
-    valid = labels != -100
-    if int(valid.sum().item()) < 2:
-        return embedding.sum() * 0.0
-    z = F.normalize(embedding[valid], dim=-1)
-    y = labels[valid]
-    sim = z @ z.t()
-    same = y[:, None] == y[None, :]
-    eye = torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
-    different = (~same) & (~eye)
-    if not bool(different.any().item()):
-        return embedding.sum() * 0.0
-    return F.relu(sim[different] - margin).mean()
+class CardDetailMatchingHead(nn.Module):
+    def __init__(self, embedding_dim: int = 128, temperature: float = 0.07) -> None:
+        super().__init__()
+        self.card_projection = nn.Linear(embedding_dim, embedding_dim)
+        self.detail_projection = nn.Linear(embedding_dim, embedding_dim)
+        self.temperature = float(temperature)
+
+    def forward(self, card_summaries: torch.Tensor, held_out_details: torch.Tensor) -> torch.Tensor:
+        cards = F.normalize(self.card_projection(card_summaries), dim=-1)
+        details = F.normalize(self.detail_projection(held_out_details), dim=-1)
+        return details @ cards.t() / max(self.temperature, 1e-6)
 
 
-def binary_metrics(logits: torch.Tensor, labels: torch.Tensor, prefix: str) -> dict[str, float]:
-    probs = torch.sigmoid(logits)
-    pred = probs >= 0.5
-    labels_bool = labels >= 0.5
-    tp = (pred & labels_bool).sum().item()
-    tn = ((~pred) & (~labels_bool)).sum().item()
-    fp = (pred & (~labels_bool)).sum().item()
-    fn = ((~pred) & labels_bool).sum().item()
-    precision = tp / max(1, tp + fp)
-    recall = tp / max(1, tp + fn)
-    f1 = 2 * precision * recall / max(1e-8, precision + recall)
-    return {
-        f"{prefix}_accuracy": (tp + tn) / max(1, tp + tn + fp + fn),
-        f"{prefix}_precision": precision,
-        f"{prefix}_recall": recall,
-        f"{prefix}_f1": f1,
+def masked_info_nce_loss(
+    logits: torch.Tensor,
+    valid_examples: torch.Tensor,
+    negative_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float], int]:
+    if logits.dim() != 2 or logits.shape[0] != logits.shape[1]:
+        raise ValueError("ownership InfoNCE logits must be square [B, B]")
+    batch_size = logits.shape[0]
+    valid = valid_examples.bool()
+    count = int(valid.sum().item())
+    if count == 0:
+        loss = _zero(logits)
+        return loss, {"recall_at_1": 0.0, "recall_at_5": 0.0, "mrr": 0.0, "valid_prediction_count": 0.0, "loss": 0.0}, 0
+    diagonal = torch.eye(batch_size, dtype=torch.bool, device=logits.device)
+    allowed = negative_mask.bool() | diagonal
+    allowed &= valid[:, None] & valid[None, :]
+    masked_logits = logits.masked_fill(~allowed, torch.finfo(logits.dtype).min)
+    rows = masked_logits[valid]
+    targets = torch.arange(batch_size, device=logits.device)[valid]
+    loss = F.cross_entropy(rows, targets)
+    order = rows.argsort(dim=1, descending=True)
+    ranks = (order == targets.unsqueeze(1)).nonzero(as_tuple=False)[:, 1] + 1
+    metrics = {
+        "recall_at_1": float((ranks <= 1).float().mean().detach().cpu()),
+        "recall_at_5": float((ranks <= 5).float().mean().detach().cpu()),
+        "mrr": float((1.0 / ranks.float()).mean().detach().cpu()),
+        "valid_prediction_count": float(count),
+        "loss": float(loss.detach().cpu()),
     }
+    return loss, metrics, count

@@ -1,10 +1,10 @@
 # 项目状态
 
-更新时间：2026-07-11
+更新时间：2026-07-12
 
 ## 一句话进度
 
-静态 CardEncoder 已完成并产出可靠的 summary/detail artifacts；动态状态代码已经具备解析和 smoke forward 原型，但正式单卡融合训练、完整 Ledger、Board 训练和动作策略仍未完成。
+静态 CardEncoder 已完成并产出可靠的 summary/detail artifacts；动态单卡的结构化 schema、四头 Cross-Attention、辅助任务和唯一 Kaggle 训练入口已进入云端验证阶段。只有多日真实 replay 训练产物下载并通过验收后，动态阶段才会标记完成。
 
 ## 已确认并保留的成果
 
@@ -37,18 +37,22 @@
 
 ### 动态单卡表示
 
-当前已有：
+当前已在正式源码实现：
 
-- HP、区域、附着能量、异常状态、进化与本回合出场字段的初步提取。
-- `StaticCardEmbeddingAdapter`。
-- `DynamicInstanceEncoder` 和 `CardInstanceFusion` 的可运行前向。
+- 类别、数值、计数、布尔和 validity mask 分离的 `CardDynamicBatch`。
+- 保留 serial 的 HP、区域、12 类能量、异常状态、Tool、进化与本回合出场解析。
+- 分组编码并输出 64 维表示的 `DynamicInstanceEncoder`。
+- 由动态 query 查询独立 detail token 的四头 `CardInstanceFusion`。
+- 攻击可支付、分类型剩余能量、HP/伤害、zone/role 四项辅助任务。
+- 保守特殊能量 resolver、detail-level 标签、真实 replay collator 与扩展审计。
+- 唯一 `training.train_dynamic_card_fusion` 入口和 `kaggle_dynamic_training/` Kernel。
 
-当前缺口：
+仍待真实 Kaggle 结果证明：
 
-- 动态字段仍被压入固定的临时向量，没有完整的结构化 mask 与 embedding 分支。
-- `static_detail_aggregator` 由静态 summary 查询 detail，尚未实现动态状态条件化的四头 Cross-Attention。
-- `CardInstanceFusion` 仍是静态向量与动态向量的浅层拼接。
-- 特殊能量支付 resolver、unresolved mask 和四项辅助任务尚未完成。
+- 多日期 replay 字段覆盖率和 unresolved 比例。
+- 真实 batch forward/backward、四任务梯度和 tiny-batch overfit。
+- 时间保留集指标、能量反事实诊断和 checkpoint 回载一致性。
+- best/last checkpoint 与 CPU benchmark 的实际产物。
 
 ### 时序与全局状态
 

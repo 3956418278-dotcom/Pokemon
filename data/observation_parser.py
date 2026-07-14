@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
@@ -12,6 +13,14 @@ def _value(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def _has_field(obj: Any, name: str) -> bool:
+    if obj is None:
+        return False
+    if isinstance(obj, dict):
+        return name in obj
+    return hasattr(obj, name)
 
 
 def _int(value: Any, default: int | None = 0) -> int | None:
@@ -43,14 +52,16 @@ def _relative(player_index: int | None, your_index: int) -> int | None:
 
 def _card_instance(card: Any, area: int, zone: str, slot: int, your_index: int, *, source: str = "current") -> CardInstanceState:
     player_index = _int(_value(card, "playerIndex"), None)
+    card_id = _int(_value(card, "id"), None)
     return CardInstanceState(
-        card_id=_int(_value(card, "id"), None),
+        card_id=card_id,
         serial=_int(_value(card, "serial"), None),
         player_index=player_index,
         relative_player=_relative(player_index, your_index),
         area=area,
         zone=zone,
         slot=slot,
+        copy_count=1 if card_id is not None else None,
         source=source,
     )
 
@@ -78,6 +89,22 @@ def _energy_counts(energies: list[Any]) -> list[int]:
     return counts
 
 
+def _energy_counts_are_valid(energies: list[Any]) -> bool:
+    return all(
+        (index := _int(energy, None)) is not None and 0 <= index < 12
+        for energy in energies
+    )
+
+
+def _card_ids(cards: list[Any]) -> list[int]:
+    result: list[int] = []
+    for card in cards:
+        card_id = _int(_value(card, "id"), None)
+        if card_id is not None:
+            result.append(card_id)
+    return result
+
+
 def _pokemon_instance(
     pokemon: Any,
     area: int,
@@ -86,12 +113,18 @@ def _pokemon_instance(
     player_index: int,
     your_index: int,
     conditions: list[bool] | None = None,
+    conditions_valid: bool = False,
 ) -> list[CardInstanceState]:
     if pokemon is None:
         return [_hidden_instance(area, zone, slot, player_index, your_index)]
     serial = _int(_value(pokemon, "serial"), None)
+    card_id = _int(_value(pokemon, "id"), None)
+    energy_cards = list(_value(pokemon, "energyCards", []) or [])
+    tools = list(_value(pokemon, "tools", []) or [])
+    pre_evolution = list(_value(pokemon, "preEvolution", []) or [])
+    raw_energies = list(_value(pokemon, "energies", []) or [])
     instance = CardInstanceState(
-        card_id=_int(_value(pokemon, "id"), None),
+        card_id=card_id,
         serial=serial,
         player_index=player_index,
         relative_player=_relative(player_index, your_index),
@@ -102,24 +135,34 @@ def _pokemon_instance(
         hp=_int(_value(pokemon, "hp"), None),
         max_hp=_int(_value(pokemon, "maxHp"), None),
         appear_this_turn=bool(_value(pokemon, "appearThisTurn", False)),
-        energy_counts=_energy_counts(_value(pokemon, "energies", []) or []),
-        energy_card_count=len(_value(pokemon, "energyCards", []) or []),
-        tool_count=len(_value(pokemon, "tools", []) or []),
-        pre_evolution_count=len(_value(pokemon, "preEvolution", []) or []),
+        appear_this_turn_valid=_has_field(pokemon, "appearThisTurn"),
+        energy_counts=_energy_counts(raw_energies),
+        energy_counts_valid=_has_field(pokemon, "energies") and _energy_counts_are_valid(raw_energies),
+        energy_card_count=len(energy_cards),
+        energy_cards_valid=_has_field(pokemon, "energyCards"),
+        energy_card_ids=_card_ids(energy_cards),
+        tool_count=len(tools),
+        tools_valid=_has_field(pokemon, "tools"),
+        tool_card_ids=_card_ids(tools),
+        pre_evolution_count=len(pre_evolution),
+        pre_evolution_valid=_has_field(pokemon, "preEvolution"),
+        pre_evolution_card_ids=_card_ids(pre_evolution),
         special_conditions=(conditions or [False] * 5),
+        special_conditions_valid=conditions_valid,
+        copy_count=1 if card_id is not None else None,
     )
     attached: list[CardInstanceState] = [instance]
-    for index, card in enumerate(_value(pokemon, "energyCards", []) or []):
+    for index, card in enumerate(energy_cards):
         card_state = _card_instance(card, AREA_IDS["ENERGY"], f"{zone}.energy", index, your_index)
         card_state.attached_to_serial = serial
         card_state.attachment_kind = 1
         attached.append(card_state)
-    for index, card in enumerate(_value(pokemon, "tools", []) or []):
+    for index, card in enumerate(tools):
         card_state = _card_instance(card, AREA_IDS["TOOL"], f"{zone}.tool", index, your_index)
         card_state.attached_to_serial = serial
         card_state.attachment_kind = 2
         attached.append(card_state)
-    for index, card in enumerate(_value(pokemon, "preEvolution", []) or []):
+    for index, card in enumerate(pre_evolution):
         card_state = _card_instance(card, AREA_IDS["PRE_EVOLUTION"], f"{zone}.pre_evolution", index, your_index)
         card_state.attached_to_serial = serial
         card_state.attachment_kind = 3
@@ -189,13 +232,12 @@ def parse_card_instances(observation: Any) -> list[CardInstanceState]:
     your_index = _int(_value(state, "yourIndex"), 0) or 0
     instances: list[CardInstanceState] = []
     for player_index, player in enumerate(_value(state, "players", []) or []):
+        condition_fields = ("poisoned", "burned", "asleep", "paralyzed", "confused")
         active_conditions = [
-            bool(_value(player, "poisoned", False)),
-            bool(_value(player, "burned", False)),
-            bool(_value(player, "asleep", False)),
-            bool(_value(player, "paralyzed", False)),
-            bool(_value(player, "confused", False)),
+            bool(_value(player, field_name, False))
+            for field_name in condition_fields
         ]
+        active_conditions_valid = all(_has_field(player, field_name) for field_name in condition_fields)
         for index, pokemon in enumerate(_value(player, "active", []) or []):
             instances.extend(
                 _pokemon_instance(
@@ -206,6 +248,7 @@ def parse_card_instances(observation: Any) -> list[CardInstanceState]:
                     player_index,
                     your_index,
                     active_conditions,
+                    active_conditions_valid,
                 )
             )
         for index, pokemon in enumerate(_value(player, "bench", []) or []):
@@ -230,6 +273,14 @@ def parse_card_instances(observation: Any) -> list[CardInstanceState]:
                 instances.append(_hidden_instance(AREA_IDS["LOOKING"], "looking", index, None, your_index))
             else:
                 instances.append(_card_instance(card, AREA_IDS["LOOKING"], "looking", index, your_index))
+    counts = Counter(
+        (instance.relative_player, instance.area, int(instance.card_id))
+        for instance in instances
+        if instance.card_id is not None
+    )
+    for instance in instances:
+        if instance.card_id is not None:
+            instance.copy_count = counts[(instance.relative_player, instance.area, int(instance.card_id))]
     return instances
 
 

@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
 from .game_memory import GameMemoryState
 from .observation_parser import parse_observation
 from .state_schema import ParsedObservation
+
+
+REPLAY_DATE_PATTERN = re.compile(r"(20\d{2}-\d{2}-\d{2})")
 
 
 @dataclass
@@ -29,6 +34,18 @@ class ReplayDecisionSample:
     select_type: int
     select_context: int
     done: bool = False
+    source_path: str | None = None
+    source_date: str | None = None
+
+    @property
+    def episode_key(self) -> str | None:
+        if self.episode_id is not None:
+            return f"episode:{self.episode_id}"
+        if self.replay_id is not None:
+            return f"replay:{self.replay_id}"
+        if self.source_path is not None:
+            return f"path:{self.source_path}"
+        return None
 
 
 @dataclass
@@ -43,7 +60,7 @@ class ReplayDatasetSummary:
     max_token_estimate: int = 0
 
 
-def _int(value: Any, default: int = -1) -> int:
+def _int(value: Any, default: int | None = -1) -> int | None:
     if value is None:
         return default
     if hasattr(value, "value"):
@@ -58,12 +75,25 @@ def _action_list(value: Any) -> list[int]:
     if value is None:
         return []
     if isinstance(value, list):
-        return [_int(item, 0) for item in value]
-    return [_int(value, 0)]
+        return [int(_int(item, 0) or 0) for item in value]
+    return [int(_int(value, 0) or 0)]
 
 
 def _option_type(option: dict[str, Any]) -> int:
-    return _int(option.get("type"), -1)
+    value = _int(option.get("type"), -1)
+    return int(value) if value is not None else -1
+
+
+def replay_source_date(path: str | Path) -> str | None:
+    match = REPLAY_DATE_PATTERN.search(str(path))
+    if match is None:
+        return None
+    value = match.group(1)
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
 
 
 def iter_replay_paths(paths: Iterable[Path]) -> list[Path]:
@@ -96,7 +126,7 @@ class ReplayDecisionDataset:
         self.include_no_select = include_no_select
         self.controlled_agents = controlled_agents
         self.samples: list[ReplayDecisionSample] = []
-        self.summary = ReplayDatasetSummary(replay_count=len(replay_paths))
+        self.summary = ReplayDatasetSummary()
         self._load(max_samples=max_samples)
 
     @classmethod
@@ -129,27 +159,101 @@ class ReplayDecisionDataset:
                     if max_samples is not None and len(self.samples) >= max_samples:
                         return
             else:
-                replay = json.loads(replay_path.read_text(encoding="utf-8"))
+                try:
+                    replay = json.loads(replay_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    self._record_error(replay_path, f"{type(exc).__name__}: {exc}", stage="replay_load")
+                    continue
                 self._append_replay(replay, replay_path, max_samples)
                 if max_samples is not None and len(self.samples) >= max_samples:
                     return
         self.summary.sample_count = len(self.samples)
 
     def _load_jsonl(self, replay_path: Path) -> Iterable[dict[str, Any]]:
-        for line in replay_path.read_text(encoding="utf-8").splitlines():
+        try:
+            lines = replay_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            self._record_error(replay_path, f"{type(exc).__name__}: {exc}", stage="replay_load")
+            return
+        for line_number, line in enumerate(lines, start=1):
             if line.strip():
-                yield json.loads(line)
+                try:
+                    replay = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    self._record_error(
+                        replay_path,
+                        f"{type(exc).__name__}: {exc}",
+                        stage="replay_load",
+                        line=line_number,
+                    )
+                    continue
+                yield replay
+
+    def _record_error(
+        self,
+        replay_path: Path,
+        error: str,
+        *,
+        stage: str,
+        step: int | None = None,
+        agent: int | None = None,
+        line: int | None = None,
+    ) -> None:
+        row: dict[str, Any] = {"replay": str(replay_path), "stage": stage, "error": error}
+        if step is not None:
+            row["step"] = step
+        if agent is not None:
+            row["agent"] = agent
+        if line is not None:
+            row["line"] = line
+        self.summary.parser_errors.append(row)
 
     def _append_replay(self, replay: dict[str, Any], replay_path: Path, max_samples: int | None) -> None:
+        if not isinstance(replay, dict) or not isinstance(replay.get("steps"), list):
+            self._record_error(
+                replay_path,
+                "ReplayFormatError: replay must be an object containing a steps list",
+                stage="replay_structure",
+            )
+            return
+        self.summary.replay_count += 1
         memories: dict[int, GameMemoryState] = {}
         replay_id = replay.get("id")
-        episode_id = replay.get("info", {}).get("EpisodeId")
+        info = replay.get("info")
+        episode_id = info.get("EpisodeId") if isinstance(info, dict) else None
+        source_date = replay_source_date(replay_path)
         for step_index, step in enumerate(replay.get("steps", []) or []):
+            if not isinstance(step, list):
+                self._record_error(
+                    replay_path,
+                    "ReplayFormatError: step must be a list",
+                    stage="replay_structure",
+                    step=step_index,
+                )
+                continue
             for agent_index, agent_step in enumerate(step or []):
                 if self.controlled_agents is not None and agent_index not in self.controlled_agents:
                     continue
-                observation = (agent_step or {}).get("observation")
+                if not isinstance(agent_step, dict):
+                    self._record_error(
+                        replay_path,
+                        "ReplayFormatError: agent step must be an object",
+                        stage="replay_structure",
+                        step=step_index,
+                        agent=agent_index,
+                    )
+                    continue
+                observation = agent_step.get("observation")
                 if observation is None:
+                    continue
+                if not isinstance(observation, dict):
+                    self._record_error(
+                        replay_path,
+                        "ReplayFormatError: observation must be an object",
+                        stage="replay_structure",
+                        step=step_index,
+                        agent=agent_index,
+                    )
                     continue
                 if observation.get("select") is None and not self.include_no_select:
                     self.summary.skipped_no_select += 1
@@ -157,13 +261,12 @@ class ReplayDecisionDataset:
                 try:
                     parsed = parse_observation(observation)
                 except Exception as exc:
-                    self.summary.parser_errors.append(
-                        {
-                            "replay": str(replay_path),
-                            "step": step_index,
-                            "agent": agent_index,
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
+                    self._record_error(
+                        replay_path,
+                        f"{type(exc).__name__}: {exc}",
+                        stage="observation_parse",
+                        step=step_index,
+                        agent=agent_index,
                     )
                     continue
                 memory = memories.setdefault(agent_index, GameMemoryState())
@@ -186,13 +289,13 @@ class ReplayDecisionDataset:
                 self.samples.append(
                     ReplayDecisionSample(
                         replay_id=str(replay_id) if replay_id is not None else None,
-                        episode_id=_int(episode_id, -1) if episode_id is not None else None,
+                        episode_id=_int(episode_id, None),
                         step_index=step_index,
                         agent_index=agent_index,
                         observation=observation,
-                        action=_action_list((agent_step or {}).get("action")),
-                        reward=float((agent_step or {}).get("reward") or 0.0),
-                        status=(agent_step or {}).get("status"),
+                        action=_action_list(agent_step.get("action")),
+                        reward=float(agent_step.get("reward") or 0.0),
+                        status=agent_step.get("status"),
                         parsed=parsed,
                         memory_before=memory_before,
                         memory_after=memory_after,
@@ -200,7 +303,9 @@ class ReplayDecisionDataset:
                         legal_option_types=option_types,
                         select_type=parsed.global_snapshot.select_type,
                         select_context=parsed.global_snapshot.select_context,
-                        done=str((agent_step or {}).get("status", "")).upper() == "DONE",
+                        done=str(agent_step.get("status", "")).upper() == "DONE",
+                        source_path=str(replay_path),
+                        source_date=source_date,
                     )
                 )
                 if max_samples is not None and len(self.samples) >= max_samples:
@@ -216,11 +321,15 @@ class ReplayDecisionDataset:
                     "index": index,
                     "replay_id": sample.replay_id,
                     "episode_id": sample.episode_id,
+                    "episode_key": sample.episode_key,
+                    "source_path": sample.source_path,
+                    "source_date": sample.source_date,
                     "step_index": sample.step_index,
                     "agent_index": sample.agent_index,
                     "action": sample.action,
                     "reward": sample.reward,
                     "status": sample.status,
+                    "done": sample.done,
                     "option_count": sample.option_count,
                     "select_type": sample.select_type,
                     "select_context": sample.select_context,
@@ -244,11 +353,15 @@ def collate_replay_decisions(samples: list[ReplayDecisionSample]) -> dict[str, A
             {
                 "replay_id": sample.replay_id,
                 "episode_id": sample.episode_id,
+                "episode_key": sample.episode_key,
+                "source_path": sample.source_path,
+                "source_date": sample.source_date,
                 "step_index": sample.step_index,
                 "agent_index": sample.agent_index,
                 "option_count": sample.option_count,
                 "select_type": sample.select_type,
                 "select_context": sample.select_context,
+                "done": sample.done,
             }
             for sample in samples
         ],

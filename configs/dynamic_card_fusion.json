@@ -1,0 +1,66 @@
+{
+  "schema_version": "dynamic_card_instance_v1",
+  "run_mode": "formal",
+  "runtime": {
+    "require_cuda": true,
+    "required_device_name_contains": "T4"
+  },
+  "gates": {
+    "require_energy_counterfactual": true,
+    "minimum_energy_probability_delta": 0.02,
+    "counterfactual_max_candidates": 32,
+    "require_instance_state_counterfactual": true,
+    "minimum_instance_counterfactual_token_l2": 0.000001,
+    "minimum_card_id_coverage": 0.99,
+    "minimum_attack_cost_coverage": 0.99,
+    "minimum_detail_alignment_coverage": 0.99,
+    "require_zero_parser_errors": true
+  },
+  "seed": 20260712,
+  "model": {
+    "static_dim": 128,
+    "dynamic_dim": 64,
+    "output_dim": 128,
+    "attention_heads": 4,
+    "dropout": 0.1,
+    "max_details": 7
+  },
+  "data": {
+    "train_dates": ["2026-07-08", "2026-07-09"],
+    "validation_dates": ["2026-07-10"],
+    "test_dates": ["2026-07-11"],
+    "max_train_decisions": 4096,
+    "max_validation_decisions": 1024,
+    "max_test_decisions": 1024
+  },
+  "training": {
+    "epochs": 6,
+    "decision_batch_size": 8,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "gradient_clip_norm": 1.0,
+    "num_workers": 0,
+    "loss_weights": {
+      "payable": 1.0,
+      "energy_remaining": 0.5,
+      "hp_state": 0.5,
+      "zone_role": 0.5
+    }
+  },
+  "tiny_overfit": {
+    "decision_samples": 8,
+    "steps": 300,
+    "learning_rate": 0.003,
+    "required_loss_ratio": 0.5,
+    "required_task_loss_ratios": {
+      "payable": 0.8,
+      "energy_remaining": 0.8,
+      "hp_state": 0.8,
+      "zone_role": 0.8
+    }
+  },
+  "benchmark": {
+    "warmup_iterations": 10,
+    "iterations": 100
+  }
+}

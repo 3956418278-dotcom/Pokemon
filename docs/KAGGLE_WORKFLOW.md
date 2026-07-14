@@ -11,8 +11,9 @@
 | `kaggle_cg_runtime/` | 构建自包含 `cg` runtime Dataset |
 | `kaggle_cg_runtime_dataset/` | `cg` runtime Dataset metadata；实际 `cg/` 本地生成 |
 | `kaggle_dynamic_code_dataset/` | 动态代码 Dataset metadata；代码从根源码生成 |
+| `kaggle_dynamic_training/` | 唯一正式动态单卡训练 Kernel |
 
-旧共享 PPO、旧 submission 和临时动态 smoke kernel 已从主分支移除。正式动态训练 kernel 将在 CardInstanceFusion 辅助任务实现后建立。
+旧共享 PPO、旧 submission 和临时动态 smoke kernel 已从主分支移除。正式动态训练统一由 `kaggle_dynamic_training/` 进入。
 
 ## 2. 提取热门牌组
 
@@ -116,7 +117,66 @@ kaggle datasets version \
 python scripts/sync_kaggle_dynamic_code_dataset.py --check
 ```
 
-## 6. 本地辅助命令
+`source_manifest.json` 除 Dataset 内 canonical 源码外，还记录动态 Kernel runner、
+Kernel metadata 和代码 Dataset metadata 的 SHA-256。修改入口配置或挂载 metadata 后，
+必须重新同步、检查并发布 Dataset；Kernel 启动时要求 v2 publication lineage 完整，
+并将 manifest 中的源码 hash 与 Kaggle 实际运行脚本的 runtime hash 一并写入输出 metadata。
+
+## 6. 动态单卡融合训练
+
+正式配置位于 `configs/dynamic_card_fusion.json`，首次发布使用同一入口的 `configs/dynamic_card_fusion_smoke.json`；smoke 全链路通过后，将 Kernel 入口切换到正式配置并发布下一版本。当前时间划分为：
+
+```text
+train:      2026-07-08, 2026-07-09
+validation: 2026-07-10
+test:       2026-07-11
+```
+
+发布动态源码 Dataset：
+
+```bash
+conda run -n kaggle python scripts/sync_kaggle_dynamic_code_dataset.py
+conda run -n kaggle python scripts/sync_kaggle_dynamic_code_dataset.py --check
+conda run -n kaggle kaggle datasets version \
+  -p kaggle_dynamic_code_dataset \
+  --dir-mode zip \
+  -m "sync structured dynamic card training"
+```
+
+提交并监控唯一训练 Kernel：
+
+```bash
+conda run -n kaggle kaggle kernels push -p kaggle_dynamic_training
+conda run -n kaggle kaggle kernels status f7e6n5g4/ptcg-dynamic-card-instance-train
+conda run -n kaggle kaggle kernels output \
+  f7e6n5g4/ptcg-dynamic-card-instance-train \
+  -p outputs/dynamic_card_instance \
+  -o
+```
+
+Kernel 会依次运行自动测试、replay 审计、单 batch/梯度检查、tiny overfit、正式训练、时间保留集评估、checkpoint 回载和 CPU benchmark。正式结果树为：
+
+```text
+outputs/
+├── audit/replay_feature_audit.json
+├── checkpoints/dynamic_card_fusion_best.pt
+├── checkpoints/dynamic_card_fusion_last.pt
+├── logs/training_metrics.jsonl
+├── evaluation/validation_metrics.json
+├── evaluation/diagnostic_examples.json
+├── benchmark/benchmark.json
+├── metadata/run_config.json
+├── metadata/replay_split.json
+├── metadata/artifact_versions.json
+├── metadata/kernel_wrapper_lineage.json
+└── run_summary.json
+```
+
+训练子进程失败时，以子进程写出的精确 `completed_stage` 为准；Kernel wrapper 只在同一
+`run_summary.json` 中追加 `kernel_wrapper_error`，不会把具体阶段覆盖成笼统的
+`dynamic_training`。
+
+## 7. 辅助命令
 
 重新生成 baseline decks：
 
@@ -124,11 +184,22 @@ python scripts/sync_kaggle_dynamic_code_dataset.py --check
 python scripts/make_baseline_decks.py
 ```
 
-状态编码 benchmark：
+动态单卡融合 CPU benchmark 由正式 Kernel 自动执行。下列命令仅用于 Kaggle 或其他已安装
+PyTorch 的环境中手工复现；不要在只安装 `kaggle` CLI 的本地 Conda 环境中运行：
 
 ```bash
-python scripts/benchmark_dynamic_state.py --iterations 100
+python scripts/benchmark_dynamic_card_fusion.py \
+  /path/to/replay-or-replay-directory \
+  --checkpoint outputs/dynamic_card_instance/outputs/checkpoints/dynamic_card_fusion_best.pt \
+  --config configs/dynamic_card_fusion.json \
+  --static-artifact-dir outputs/card_pretrain/artifacts \
+  --card-records outputs/card_pretrain/artifacts/card_data/card_records.json \
+  --detail-metadata outputs/card_pretrain/artifacts/card_detail_metadata.json \
+  --output outputs/dynamic_card_instance/outputs/benchmark/benchmark.json
 ```
+
+`scripts/benchmark_dynamic_state.py` 仅保留为弃用兼容入口，并会转调上述正式 benchmark；
+它不再构造随机静态向量或绕过 detail Cross-Attention。
 
 静态 energy-type probe：
 
@@ -136,7 +207,7 @@ python scripts/benchmark_dynamic_state.py --iterations 100
 python scripts/linear_probe_energy_type.py
 ```
 
-## 7. 未来正式提交
+## 8. 未来正式提交
 
 ActionEncoder、行为克隆、Value 和 self-play 完成后，再建立唯一 submission kernel。提交包顶层需要包含：
 

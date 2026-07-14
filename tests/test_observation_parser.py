@@ -6,10 +6,12 @@ from data.game_memory import GameMemoryState
 from data.observation_parser import parse_observation
 from data.state_schema import (
     AREA_IDS,
+    BOOLEAN_FEATURE_NAMES,
     CARD_APPEARANCE_FEATURE_DIM,
-    CARD_DYNAMIC_FEATURE_DIM,
     EVENT_FEATURE_DIM,
     LEDGER_FEATURE_DIM,
+    NUMERICAL_FEATURE_NAMES,
+    CardInstanceState,
     collate_card_dynamic,
 )
 
@@ -119,6 +121,9 @@ def test_parse_observation_preserves_visibility_and_instances() -> None:
     assert active.special_conditions[4] is True
     assert active.energy_counts[0] == 1
     assert active.energy_counts[2] == 1
+    assert active.energy_card_ids == [1]
+    assert active.tool_card_ids == [9]
+    assert active.pre_evolution_card_ids == [20]
     assert any(x.attachment_kind == 1 and x.attached_to_serial == 10 for x in parsed.card_instances)
     assert any(x.area == AREA_IDS["LOOKING"] and not x.is_visible for x in parsed.card_instances)
 
@@ -129,7 +134,11 @@ def test_dynamic_batch_and_memory_shapes() -> None:
     memory = GameMemoryState().update_from_parsed(parsed)
     appearance = memory.appearance_features(parsed.card_instances)
     batch = collate_card_dynamic(parsed.card_instances, appearance)
-    assert batch.dynamic_features.shape == (len(parsed.card_instances), CARD_DYNAMIC_FEATURE_DIM)
+    assert batch.numerical_features.shape == (len(parsed.card_instances), len(NUMERICAL_FEATURE_NAMES))
+    assert batch.numerical_mask.shape == batch.numerical_features.shape
+    assert batch.energy_counts.shape == (len(parsed.card_instances), 12)
+    assert batch.condition_flags.shape == (len(parsed.card_instances), 5)
+    assert batch.boolean_features.shape == (len(parsed.card_instances), len(BOOLEAN_FEATURE_NAMES))
     assert batch.appearance_features.shape == (len(parsed.card_instances), CARD_APPEARANCE_FEATURE_DIM)
     assert len(memory.recent_events) == 2
     assert memory.serials[110].attached is True
@@ -143,3 +152,78 @@ def test_log_type_zero_is_preserved() -> None:
     obs["logs"] = [{"type": 0, "playerIndex": 0}]
     parsed = parse_observation(obs)
     assert parsed.events[0].event_type == 0
+
+
+def test_dynamic_batch_distinguishes_missing_hp_from_real_zero_and_preserves_serial_zero() -> None:
+    torch = pytest.importorskip("torch")
+    instances = [
+        CardInstanceState(21, 0, 0, 0, AREA_IDS["ACTIVE"], "active", 0, is_pokemon=True, hp=0, max_hp=120),
+        CardInstanceState(40, 7, 0, 0, AREA_IDS["HAND"], "hand", 0, hp=None, max_hp=None),
+    ]
+    batch = collate_card_dynamic(instances)
+    assert batch.serials.tolist() == [0, 7]
+    assert batch.numerical_features[0, 0].item() == 0.0
+    assert batch.numerical_mask[0, 0].item() == 1.0
+    assert batch.numerical_features[1, 0].item() == 0.0
+    assert batch.numerical_mask[1, 0].item() == 0.0
+    assert torch.isfinite(batch.numerical_features).all()
+
+
+def test_same_card_id_with_different_serials_stays_as_two_instances() -> None:
+    obs = _observation()
+    obs["current"]["players"][0]["bench"] = [
+        _pokemon(21, 100, 0, hp=120),
+        _pokemon(21, 101, 0, hp=80),
+    ]
+    parsed = parse_observation(obs)
+    matches = [item for item in parsed.card_instances if item.card_id == 21 and item.zone == "bench"]
+    assert [item.serial for item in matches] == [100, 101]
+    assert [item.hp for item in matches] == [120, 80]
+
+
+def test_copy_count_is_grouped_without_losing_serials() -> None:
+    obs = _observation()
+    obs["current"]["players"][0]["hand"] = [_card(40, 13, 0), _card(40, 14, 0)]
+    parsed = parse_observation(obs)
+    hand = [item for item in parsed.card_instances if item.zone == "hand" and item.card_id == 40]
+    assert [item.serial for item in hand] == [13, 14]
+    assert [item.copy_count for item in hand] == [2, 2]
+
+
+def test_unknown_energy_enum_invalidates_energy_supervision() -> None:
+    obs = _observation()
+    obs["current"]["players"][0]["active"][0]["energies"] = [5, 99]
+    parsed = parse_observation(obs)
+    active = [item for item in parsed.card_instances if item.serial == 10][0]
+    assert active.energy_counts[5] == 1
+    assert not active.energy_counts_valid
+
+
+def test_empty_energy_list_is_valid_zero_but_missing_list_is_unknown() -> None:
+    empty_obs = _observation()
+    empty_obs["current"]["players"][0]["active"][0]["energies"] = []
+    empty = parse_observation(empty_obs).card_instances[0]
+    assert empty.energy_counts == [0] * 12
+    assert empty.energy_counts_valid
+
+    missing_obs = _observation()
+    del missing_obs["current"]["players"][0]["active"][0]["energies"]
+    missing = parse_observation(missing_obs).card_instances[0]
+    assert missing.energy_counts == [0] * 12
+    assert not missing.energy_counts_valid
+
+
+def test_missing_or_partial_condition_fields_are_not_valid_zeroes() -> None:
+    missing_obs = _observation()
+    player = missing_obs["current"]["players"][0]
+    for name in ("poisoned", "burned", "asleep", "paralyzed", "confused"):
+        player.pop(name)
+    missing = parse_observation(missing_obs).card_instances[0]
+    assert missing.special_conditions == [False] * 5
+    assert not missing.special_conditions_valid
+
+    partial_obs = _observation()
+    del partial_obs["current"]["players"][0]["confused"]
+    partial = parse_observation(partial_obs).card_instances[0]
+    assert partial.special_conditions[0]
+    assert not partial.special_conditions_valid

@@ -1,7 +1,7 @@
 {
-  "id": "f7e6n5g4/ptcg-card-pretrain-v2",
-  "title": "ptcg-card-pretrain-v2",
-  "code_file": "run_card_pretrain.py",
+  "id": "f7e6n5g4/ptcg-card-pretrain-v2-formal",
+  "title": "ptcg-card-pretrain-v2-formal",
+  "code_file": "run_card_pretrain_formal.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": true,

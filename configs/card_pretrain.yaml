@@ -1,47 +1,109 @@
-seed: 20260710
+schema_version: static_card_training_v3
+run_mode: static_v3_formal
+seed: 20260713
 
 data:
-  cache_dir: artifacts/card_data
-  validation_ratio: 0.15
-  split_mode: card_id
+  cache_dir: artifacts/card_data_v3
+  validation_ratio: 0.10
+  test_ratio: 0.10
+  split_mode: connected_component
 
 model:
   embedding_dim: 128
   detail_token_dim: 128
-  detail_pooling: attention
-  text_encoder_name: hashing
-  freeze_text_encoder: false
+  attention_heads: 4
+  transformer_layers: 2
+  ffn_dim: 256
+  dropout: 0.0
+
+tokenizer:
+  tokenizer_type: sentencepiece
+  model_type: unigram
+  vocab_size: 1024
+  hard_vocab_limit: false
+  character_coverage: 1.0
+  byte_fallback: false
+  pad_id: 0
+  unk_id: 1
+  bos_id: -1
+  eos_id: -1
+  user_defined_symbols: ["[MASK_TEXT]"]
+  input_sentence_size: 0
+  shuffle_input_sentence: false
+  max_text_subword_tokens: 256
+  output_dir: outputs/static_v3_formal/tokenizer
 
 training:
-  batch_size: 64
-  relation_batch_size: 96
-  attack_relation_batch_size: 96
-  max_epochs: 400
-  min_epochs: 80
-  eval_every_epochs: 5
-  learning_rate: 3.0e-4
-  weight_decay: 1.0e-4
-  checkpoint_dir: checkpoints
-  log_dir: logs
-  device: cpu
+  micro_batch_size: 32
+  gradient_accumulation_steps: 1
+  effective_batch_size: 32
+  relation_batch_size: 64
+  max_epochs: 100
+  eval_every_epochs: 1
+  evaluation_seed_offsets: [1000000, 2000000, 3000000]
+  optimizer:
+    name: AdamW
+    learning_rate: 3.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+  scheduler:
+    name: linear_warmup_cosine
+    update_unit: optimizer_step
+    horizon_epochs: 100
+    warmup_ratio: 0.05
+    eta_min: 0.0
+  gradient_clip_norm: 1.0
+  checkpoint_dir: outputs/static_v3_formal/checkpoints
+  log_dir: outputs/static_v3_formal/logs
+  device: cuda
   early_stopping:
     enabled: true
-    patience: 40
+    metric: validation_weighted_total_loss
+    patience: 12
+    min_delta: 0.0001
     restore_best_checkpoint: true
   masking:
-    categorical_probability: 0.10
-    numeric_probability: 0.10
-    text_token_dropout: 0.10
-    detail_field_probability: 0.10
+    card_field_group_probability: 0.15
+    text_token_probability: 0.15
+    structure_reference_probability: 0.15
 
 tasks:
-  mask_probability: 0.15
-  temperature: 0.07
-  energy_separation_margin: 0.25
+  field_recovery: true
+  detail_attributes: true
+  text_mlm: true
+  structure_reference: true
+  card_detail_matching: true
 
 loss_weights:
-  mask: 1.0
-  contrastive: 1.0
-  relation: 1.0
-  detail: 1.0
-  energy: 0.0
+  field_recovery: 1.0
+  detail_attributes: 1.0
+  text_mlm: 0.5
+  structure_reference: 0.5
+  card_detail_matching: 1.0
+
+tiny_overfit:
+  enabled: true
+  selection_state: pending_v3_coverage_scan
+  # Formal training refuses to start until a v3 full-catalog coverage scan has
+  # selected and frozen exactly 16 IDs and their coverage hash below.
+  card_ids: []
+  coverage_sha256: PENDING_V3_COVERAGE_SCAN
+  card_count: 16
+  max_steps: 500
+  batch_size_cards: 16
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+  fixed_masks: true
+  thresholds:
+    total_loss_ratio: 0.30
+    per_active_task_loss_ratio: 0.50
+  require_finite: true
+  require_save_reload: true
+
+production_refit:
+  enabled: true
+  epoch_source: best_validation_epoch
+  scheduler_horizon_epochs: 100
+  checkpoint_path: outputs/static_v3_formal/checkpoints/card_encoder_production_refit.pt
+  log_path: outputs/static_v3_formal/logs/production_refit_metrics.jsonl
