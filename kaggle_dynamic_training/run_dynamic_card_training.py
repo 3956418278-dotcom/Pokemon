@@ -81,39 +81,26 @@ def _find_code_root() -> Path:
 
 
 def _find_static_artifact_dir() -> Path:
-    required = {
-        "card_embeddings.pt",
-        "card_detail_tokens.pt",
-        "card_detail_masks.pt",
-        "card_detail_type_ids.pt",
-        "card_id_to_index.json",
-    }
     static_root = INPUT_ROOT / "ptcg-card-pretrain"
-    search_root = static_root if static_root.exists() else INPUT_ROOT
-    for weight_path in search_root.rglob("card_embeddings.pt"):
-        parent = weight_path.parent
-        if all((parent / name).exists() for name in required):
-            return parent
-    raise FileNotFoundError("could not locate a complete static CardEncoder artifact directory")
+    if static_root.exists():
+        return static_root
+    return INPUT_ROOT
 
 
 def _find_card_records() -> Path:
     static_root = INPUT_ROOT / "ptcg-card-pretrain"
-    paths = sorted((static_root if static_root.exists() else INPUT_ROOT).rglob("card_records.json"))
-    if not paths:
-        raise FileNotFoundError("could not locate card_records.json in Kaggle inputs")
-    return paths[0]
+    search_root = static_root if static_root.exists() else INPUT_ROOT
+    paths = sorted(search_root.rglob("card_records.json"))
+    if paths:
+        return paths[0]
+    return search_root / "card_records.json"
 
 
 def _find_detail_metadata(static_artifact_dir: Path) -> Path:
     direct = static_artifact_dir / "card_detail_metadata.json"
     if direct.exists():
         return direct
-    static_root = INPUT_ROOT / "ptcg-card-pretrain"
-    paths = sorted((static_root if static_root.exists() else INPUT_ROOT).rglob("card_detail_metadata.json"))
-    if not paths:
-        raise FileNotFoundError("could not locate card_detail_metadata.json in Kaggle inputs")
-    return paths[0]
+    return static_artifact_dir / "card_detail_metadata.json"
 
 
 def _daily_replay_dir(date: str) -> Path:

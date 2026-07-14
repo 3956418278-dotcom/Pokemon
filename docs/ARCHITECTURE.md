@@ -32,26 +32,19 @@ serial  = 一局对战中的具体卡牌副本
 
 同一 Card ID 的多行静态 CSV 表示多个攻击或技能条目。它们先聚合成一张卡，再生成多个 detail token。场上出现两张相同 Card ID 时，它们拥有不同 serial 和不同动态状态。
 
-## 3. 静态 CardEncoder
+## 3. 静态卡牌模块边界
 
-静态层只描述不会随对局变化的事实：
+静态卡牌部分已交由 colleague 脚本完整实现（置于 `static_card/` 目录），包含 CSV 定位与读取、同一 Card ID 聚合、静态特征构造、预训练与静态产物导出。根目录不再维护重复的静态 pre-preprocessing、schema 或 CardEncoder。
 
-- 卡牌类型、Pokémon 类型、阶段和 HP。
-- 弱点、抗性、撤退费用与进化关系。
-- Trainer、Energy 和 rule flags。
-- 每个攻击的费用、伤害和文字。
-- 每个特性和特殊效果。
+根目录的 `StaticCardAdapter` 为唯一接入边界，它只负责读取 colleague 正式导出的产物并对外暴露以下接口：
 
-输出：
+- `card_summary`
+- `detail_tokens` 或等价的细节表示
+- `detail_mask`
+- `detail_type_ids` 或等价的类型信息
+- `known_mask`
 
-```text
-card_summary:     [B, 128]
-detail_tokens:    [B, M, 128]
-detail_mask:      [B, M]
-detail_type_ids:  [B, M]
-```
-
-后续阶段直接读取已训练 artifacts。静态 summary 和 detail 保持独立，多个攻击不会提前平均成一组统计量。
+后续动态模型（如 `CardInstanceFusion`）将通过该适配器透明接入静态特征，静态与动态在物理和架构上均完成解耦。
 
 ## 4. 动态卡牌实例
 

@@ -42,21 +42,18 @@
 
 | 模块 | 状态 | 当前结果 |
 |---|---|---|
-| 静态卡牌预处理 | 完成 | 同一 Card ID 聚合为一张卡，多攻击/特性保持独立 detail |
-| 静态 CardEncoder | 完成 | 1267 张卡；128 维 summary 与逐 detail token 已训练并导出 |
+| 静态卡牌表示 | 模块重构 | 静态卡牌特征、训练与导出完整采用 colleague 提供的脚本，根目录不再维护独立静态 pipeline |
 | Observation / replay 解析 | 初版完成 | 支持变长 replay、公开性边界和 decision sample 构造 |
-| 动态单卡表示 | 云端验证中 | 结构化字段、四头动态 Cross-Attention、四项辅助任务和正式训练入口已实现；真实多日训练产物待 Kaggle 回收 |
+| 动态单卡表示 | 等待接入 | 结构化字段、动态 Cross-Attention 与辅助任务原型已实现，等待 colleague 静态产物接入 |
 | Ledger / Recent Events | 原型 | 已有最小记忆接口，正式长期认知与幂等更新待完成 |
-| Board Transformer | 原型 | 可完成 smoke forward，尚无正式动态 checkpoint |
+| Board Transformer | 原型 | 支持变长 [STATE]/[DECISION]/[MATCH]/Ledger/Event 及单卡实例表示，输出 state_embedding 提取完毕 |
 | ActionEncoder / 行为克隆 / Value / PPO | 尚未进入主线 | 旧 PPO 代码仅作为历史 baseline |
 
-静态 CardEncoder 的成功训练产物位于本地 `outputs/card_pretrain/`，该目录由 `.gitignore` 排除。当前准确进度与下一步见 [项目状态](docs/STATUS.md)。
-
-## 当前架构
+当前处于静态模块替换阶段。静态卡牌特征已交由 `static_card/` colleague 脚本独立处理，当前仓库主要负责决策点 replay 解析、动态实例编码、Ledger 与全局 Board 状态以及后续的策略学习。动态训练等待 colleague 静态 artifacts 结构确定后接入 `StaticCardAdapter`。
 
 ```mermaid
 flowchart TD
-    A["Card ID"] --> B["Static CardEncoder"]
+    A["Card ID"] --> B["StaticCardAdapter (colleague static artifacts)"]
     C["Current observation"] --> D["Dynamic Instance Encoder"]
     E["Logs + previous memory"] --> F["Ledger + Recent Events"]
     B --> G["Card Instance Fusion"]
@@ -65,7 +62,7 @@ flowchart TD
     F --> I["Board Transformer"]
     G --> I
     H --> I
-    I --> J["State embedding"]
+    I --> J["state_embedding"]
     J --> K["Future ActionEncoder / Policy"]
 ```
 
@@ -74,15 +71,14 @@ flowchart TD
 ## 仓库结构
 
 ```text
-configs/                     静态训练配置
-data/                        卡牌预处理、observation/replay 数据结构与解析
+static_card/                 colleague 提供的完整静态卡牌模块 (CSV, 数据, 模型, 预训练与导出)
+data/                        observation/replay 数据结构与解析，动态卡牌 dataset
 decks/                       原始牌组、Card ID 匹配结果与 baseline 牌组
-models/                      CardEncoder、动态实例、融合与 Board 模型
-training/                    静态 CardEncoder 训练、导出和评估
+models/                      动态实例、单卡融合、Board Transformer 与 StaticCardAdapter 边界
+training/                    动态融合模型训练与评估
 scripts/                     数据审计、牌组构造、benchmark 与 Kaggle 辅助脚本
-tests/                       静态、动态、replay 和可见性测试
+tests/                       动态模型、观察解析、replay 相关的单元测试
 
-kaggle_card_pretrain/        静态 CardEncoder 训练 kernel
 kaggle_cg_runtime/           构建 cg runtime Dataset 的自包含 kernel
 kaggle_cg_runtime_dataset/   cg runtime Dataset metadata
 kaggle_dynamic_code_dataset/ 动态代码 Dataset metadata；代码由同步脚本生成
@@ -116,22 +112,10 @@ docs/reference/              字段审计与事实资料
 
 ## 常用入口
 
-静态 CardEncoder 本地流程：
-
-```bash
-python -m training.pretrain_card_encoder --config configs/card_pretrain.yaml --rebuild-cache
-python -m training.export_card_embeddings \
-  --checkpoint checkpoints/card_encoder_best.pt \
-  --output artifacts/card_embeddings.pt
-python -m training.evaluate_card_embeddings \
-  --embeddings artifacts/card_embeddings.pt \
-  --output-dir artifacts/card_embedding_analysis
-```
-
 测试：
 
 ```bash
-python -m pytest -q
+python -m pytest tests/ -q
 ```
 
 Kaggle 训练与部署命令集中维护在 [docs/KAGGLE_WORKFLOW.md](docs/KAGGLE_WORKFLOW.md)。

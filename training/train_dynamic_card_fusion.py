@@ -805,20 +805,16 @@ def artifact_versions(
     card_records: Path,
     detail_metadata: Path,
 ) -> dict[str, Any]:
-    paths = [
-        static_dir / "card_embeddings.pt",
-        static_dir / "card_detail_tokens.pt",
-        static_dir / "card_detail_masks.pt",
-        static_dir / "card_detail_type_ids.pt",
-        static_dir / "card_id_to_index.json",
-        static_dir / "card_embedding_metadata.json",
-        card_records,
-        detail_metadata,
-    ]
+    paths = []
+    if static_dir.exists():
+        paths.extend(p for p in static_dir.iterdir() if p.is_file())
+    if card_records.exists():
+        paths.append(card_records)
+    if detail_metadata.exists():
+        paths.append(detail_metadata)
     files = {
         path.name: {"path": str(path), "sha256": _sha256(path), "size_bytes": path.stat().st_size}
         for path in paths
-        if path.exists()
     }
     source_manifest = Path(__file__).resolve().parents[1] / "source_manifest.json"
     return {

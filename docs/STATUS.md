@@ -1,28 +1,20 @@
 # 项目状态
 
-更新时间：2026-07-12
+更新时间：2026-07-14
 
 ## 一句话进度
 
-静态 CardEncoder 已完成并产出可靠的 summary/detail artifacts；动态单卡的结构化 schema、四头 Cross-Attention、辅助任务和唯一 Kaggle 训练入口已进入云端验证阶段。只有多日真实 replay 训练产物下载并通过验收后，动态阶段才会标记完成。
+本轮已清除本地静态路线（包括旧 CardEncoder、旧 Pretrain-Heads 和旧静态 pre-processing）。静态卡牌特征、训练与导出已完全交由 colleague 提供的脚本（置于 `static_card/` 目录）唯一实现。动态与局面接口原型已保留并进行了 Board token 顺序与 state_embedding 的修正，处于等待 colleague 静态产物接入阶段。
 
 ## 已确认并保留的成果
 
 ### 静态卡牌表示
 
-- CSV 中同一 Card ID 的多行已经聚合为一个 `CardRecord`。
-- 多个攻击、特性和特殊效果保留为独立 detail，费用、伤害和文本绑定不丢失。
-- 当前卡池共 1267 张卡。
-- 成功产物包含：
-  - 128 维 `card_summary`
-  - 128 维 `detail_tokens`
-  - `detail_mask`
-  - `detail_type_ids`
-  - Card ID 映射与 metadata
-- Basic Energy 的类型信息通过显式静态字段保留。
-- 静态辅助训练、best/last checkpoint 和 embedding 分析已经完成。
+- 根目录不再维护任何 CSV reader、独立静态 schema 或 static card training/exporting 流程。
+- 静态卡牌的全部逻辑与输出结构均由 colleague 脚本完整定义。
+- 根目录仅保留 `models/static_card_adapter.py` 作为对 colleague 静态产物的适配层。
 
-静态产物继续作为后续模型的固定输入。本阶段保持其 schema 与 checkpoint 不变。
+当前适配层已重写为清晰的接口壳，静态 artifacts 待 colleague 导出后正式挂载。
 
 ### Replay 与 observation 基础设施
 
@@ -102,7 +94,8 @@
 ## 当前唯一主线
 
 ```text
-静态 artifacts
+colleague 静态 artifacts
+→ StaticCardAdapter 接入层
 → 真实 replay 决策点
 → 动态 CardInstanceFusion
 → Ledger + Recent Events + Board Transformer
@@ -114,7 +107,7 @@
 
 ## 仓库清理结果
 
-- 当前仓库只保留静态训练、动态状态、replay 数据和未来策略需要的正式源码。
-- Kaggle 动态代码副本改为由 `scripts/sync_kaggle_dynamic_code_dataset.py` 生成。
-- 旧 PPO 三套重复目录、临时动态 smoke 训练、旧 CardInstanceEncoder 和 replay notebook 已移除。
+- 当前仓库彻底清除了本地静态 CardEncoder、CardDataset 与 pre-processing 流程，相关逻辑移交给 `static_card/` 目录。
+- 根目录保留动态状态、时序全局 Board、replay 数据和未来策略学习所需的正式源码。
+- Kaggle 动态代码副本由 `scripts/sync_kaggle_dynamic_code_dataset.py` 生成（排除了已被清理的 static_detail_aggregator）。
 - 牌组资料统一放在 `decks/`。

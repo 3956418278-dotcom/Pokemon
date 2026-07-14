@@ -23,7 +23,6 @@ CANONICAL_FILES = [
     "data/dynamic_card_dataset.py",
     "models/__init__.py",
     "models/static_card_adapter.py",
-    "models/static_detail_aggregator.py",
     "models/dynamic_instance_encoder.py",
     "models/card_instance_fusion.py",
     "models/dynamic_card_auxiliary.py",

@@ -90,13 +90,14 @@ class BoardTokenizer(nn.Module):
         card_tokens = card_tokens + self.type_embedding(torch.ones_like(area_ids.long()).clamp_max(3))
         global_token = self.global_projection(global_features.float()).unsqueeze(1)
         global_token = global_token + self.type_embedding(torch.zeros(batch_size, 1, dtype=torch.long, device=global_token.device))
-        token_parts = [global_token, card_tokens]
+        
+        token_parts = [global_token]
         global_mask = torch.ones(batch_size, 1, dtype=card_mask.dtype, device=card_mask.device)
-        mask_parts = [global_mask, card_mask.float()]
+        mask_parts = [global_mask]
         type_parts = [
             torch.zeros(batch_size, 1, dtype=torch.long, device=card_instance_embeddings.device),
-            torch.ones(batch_size, card_count, dtype=torch.long, device=card_instance_embeddings.device),
         ]
+        
         if decision_features is not None:
             if decision_features.dim() == 1:
                 decision_features = decision_features.unsqueeze(0)
@@ -133,6 +134,11 @@ class BoardTokenizer(nn.Module):
             token_parts.append(event_tokens)
             mask_parts.append(event_mask.float())
             type_parts.append(torch.full((batch_size, event_tokens.size(1)), 3, dtype=torch.long, device=event_tokens.device))
+            
+        token_parts.append(card_tokens)
+        mask_parts.append(card_mask.float())
+        type_parts.append(torch.ones(batch_size, card_count, dtype=torch.long, device=card_instance_embeddings.device))
+        
         tokens = torch.cat(token_parts, dim=1)
         mask = torch.cat(mask_parts, dim=1)
         type_ids = torch.cat(type_parts, dim=1)

@@ -20,6 +20,11 @@ checkpoints/
 logs/
 runs/
 wandb/
+*.patch
+static_card/outputs/
+static_card/artifacts/
+static_card/checkpoints/
+static_card/logs/
 kaggle_dynamic_state_tests_output*/
 data_from_submission/replay_audit/
 data_from_submission/replay_dataset/

@@ -10,7 +10,12 @@ import torch.nn as nn
 class BoardEncoderOutput:
     tokens: torch.Tensor
     mask: torch.Tensor
-    pooled: torch.Tensor
+    state_embedding: torch.Tensor
+
+    @property
+    def pooled(self) -> torch.Tensor:
+        """Alias for compatibility with older components."""
+        return self.state_embedding
 
 
 class BoardTransformer(nn.Module):
@@ -42,5 +47,5 @@ class BoardTransformer(nn.Module):
         key_padding_mask = mask <= 0
         encoded = self.encoder(tokens, src_key_padding_mask=key_padding_mask)
         encoded = self.norm(encoded)
-        pooled = (encoded * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return BoardEncoderOutput(tokens=encoded, mask=mask, pooled=pooled)
+        state_embedding = encoded[:, 0]
+        return BoardEncoderOutput(tokens=encoded, mask=mask, state_embedding=state_embedding)

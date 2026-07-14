@@ -10,7 +10,7 @@ from data.state_schema import collate_card_dynamic
 from models.card_instance_fusion import CardInstanceFusion
 from models.dynamic_instance_encoder import DynamicInstanceEncoder
 
-from .test_observation_parser import _observation
+from tests.test_observation_parser import _observation
 
 
 def test_dynamic_instance_encoder_and_fusion_backward() -> None:

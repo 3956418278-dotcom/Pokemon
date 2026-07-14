@@ -311,14 +311,7 @@ def test_auxiliary_heads_support_distinct_token_and_detail_dimensions() -> None:
 
 
 def test_static_artifacts_remain_frozen_during_dynamic_backward() -> None:
-    adapter = StaticCardEmbeddingAdapter(
-        torch.randn(2, 128),
-        {"21": 0, "22": 1},
-        freeze=True,
-        detail_tokens=torch.randn(2, 2, 128),
-        detail_mask=torch.ones(2, 2),
-        detail_type_ids=torch.ones(2, 2, dtype=torch.long),
-    )
+    adapter = StaticCardEmbeddingAdapter(embedding_dim=128, max_details=2, detail_dim=128)
     batch = collate_card_dynamic([_instance()])
     static = adapter.forward_features(batch.card_ids)
     dynamic_encoder = DynamicInstanceEncoder(dropout=0.0)
@@ -331,7 +324,7 @@ def test_static_artifacts_remain_frozen_during_dynamic_backward() -> None:
         static.detail_type_ids,
     )
     token.square().mean().backward()
-    assert not adapter.embedding.weight.requires_grad
-    assert adapter.embedding.weight.grad is None
+    assert not adapter.dummy_param.requires_grad
+    assert adapter.dummy_param.grad is None
     assert any(parameter.grad is not None for parameter in dynamic_encoder.parameters())
     assert any(parameter.grad is not None for parameter in fusion.parameters())
