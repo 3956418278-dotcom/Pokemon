@@ -11,10 +11,14 @@ if str(ROOT) not in sys.path:
 
 from data.dynamic_card_dataset import AttackCostCatalog, collate_dynamic_card_samples
 from data.replay_dataset import ReplayDecisionDataset
+from models.static_card_adapter import StaticCardAdapter
 from training.train_dynamic_card_fusion import cpu_benchmark
+from training.train_dynamic_card_fusion import require_static_adapter_ready
 
 
 def main() -> None:
+    static_adapter = StaticCardAdapter()
+    require_static_adapter_ready(static_adapter)
     parser = argparse.ArgumentParser(description="Benchmark a trained dynamic CardInstanceFusion checkpoint on CPU.")
     parser.add_argument("replay_paths", type=Path, nargs="+")
     parser.add_argument("--checkpoint", type=Path, required=True)

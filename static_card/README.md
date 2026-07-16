@@ -1,13 +1,7 @@
 # Colleague Static Card Module
 
-This directory contains the colleague's implementation of the static card representation pipeline.
-All static logic (including CSV reading, detail feature aggregation, static card pretraining, evaluation, and static artifact export) is self-contained in this directory.
+This directory is reserved for the colleague's complete static card module.
 
-## Directory Structure
-- `configs/`: Static training configs.
-- `data/`: CSV loading, parsing, and Dataset construction.
-- `models/`: Static CardEncoder model structure.
-- `training/`: Pretraining, exporting, and evaluation pipelines.
-- `scripts/`: Static utilities.
-- `tests/`: Module unit tests.
-- `kaggle/`: Kaggle kernel build and training runner scripts.
+The imported module will own CSV reading, card aggregation, feature construction, models, training, evaluation, and artifact export. None of those responsibilities are implemented by the root repository.
+
+The artifact contract is not defined yet. Integration with the dynamic code will occur only through `models/static_card_adapter.py` after the colleague module and its contract are provided.

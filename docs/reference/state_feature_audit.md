@@ -2,9 +2,9 @@
 
 本文件只记录已经从源码或 replay 验证的字段事实。模型设计见 `docs/ARCHITECTURE.md`，项目进度见 `docs/STATUS.md`。
 
-## 1. 静态卡牌 baseline
+## 1. 已退出主线的历史静态 baseline
 
-正式入口：
+以下路径是历史记录，均已退出主线并从当前工作树删除：
 
 - `data/card_preprocessing.py`：读取 CSV 与 `cg.api`，按 Card ID 聚合 `CardRecord`。
 - `data/card_dataset.py`：构造 schema、detail batch 和 Card ID split。

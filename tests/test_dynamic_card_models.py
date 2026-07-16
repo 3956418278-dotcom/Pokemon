@@ -11,7 +11,7 @@ from data.state_schema import AREA_IDS, CardInstanceState, collate_card_dynamic
 from models.card_instance_fusion import CardInstanceFusion, CardInstanceFusionOutput
 from models.dynamic_card_auxiliary import DynamicCardAuxiliaryHeads
 from models.dynamic_instance_encoder import DynamicInstanceEncoder
-from models.static_card_adapter import StaticCardEmbeddingAdapter
+from tests.fakes.static_card_adapter import FakeStaticCardAdapter
 
 
 def _instance() -> CardInstanceState:
@@ -311,20 +311,26 @@ def test_auxiliary_heads_support_distinct_token_and_detail_dimensions() -> None:
 
 
 def test_static_artifacts_remain_frozen_during_dynamic_backward() -> None:
-    adapter = StaticCardEmbeddingAdapter(embedding_dim=128, max_details=2, detail_dim=128)
+    adapter = FakeStaticCardAdapter(
+        torch.randn(1, 128),
+        {"21": 0},
+        detail_tokens=torch.randn(1, 2, 128),
+        detail_mask=torch.ones(1, 2),
+        detail_type_ids=torch.ones(1, 2, dtype=torch.long),
+    )
     batch = collate_card_dynamic([_instance()])
     static = adapter.forward_features(batch.card_ids)
     dynamic_encoder = DynamicInstanceEncoder(dropout=0.0)
     fusion = CardInstanceFusion(dropout=0.0)
     token = fusion(
-        static.summary,
+        static.card_summary,
         dynamic_encoder(batch),
         static.detail_tokens,
         static.detail_mask,
         static.detail_type_ids,
     )
     token.square().mean().backward()
-    assert not adapter.dummy_param.requires_grad
-    assert adapter.dummy_param.grad is None
+    assert not adapter.embedding.weight.requires_grad
+    assert adapter.embedding.weight.grad is None
     assert any(parameter.grad is not None for parameter in dynamic_encoder.parameters())
     assert any(parameter.grad is not None for parameter in fusion.parameters())

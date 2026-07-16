@@ -1,113 +1,46 @@
 # 项目状态
 
-更新时间：2026-07-14
+更新时间：2026-07-16
 
-## 一句话进度
+## 当前结论
 
-本轮已清除本地静态路线（包括旧 CardEncoder、旧 Pretrain-Heads 和旧静态 pre-processing）。静态卡牌特征、训练与导出已完全交由 colleague 提供的脚本（置于 `static_card/` 目录）唯一实现。动态与局面接口原型已保留并进行了 Board token 顺序与 state_embedding 的修正，处于等待 colleague 静态产物接入阶段。
+静态模块将完整采用 colleague 的脚本，包括 CSV 读取、同 Card ID 聚合、特征、模型、训练、评估和导出。`static_card/` 当前只是正式模块预留位置，仓库内没有可替代 colleague 实现的静态模型。
 
-## 已确认并保留的成果
+根仓库负责 replay、动态卡牌实例、memory、Board、动作和策略。`models/static_card_adapter.py` 是唯一跨模块边界；真实 artifact contract 尚未确定，正式动态训练和 benchmark 当前暂停。
 
-### 静态卡牌表示
+## 已保留能力
 
-- 根目录不再维护任何 CSV reader、独立静态 schema 或 static card training/exporting 流程。
-- 静态卡牌的全部逻辑与输出结构均由 colleague 脚本完整定义。
-- 根目录仅保留 `models/static_card_adapter.py` 作为对 colleague 静态产物的适配层。
+- observation 与变长 replay 解析、决策点样本和公开信息边界。
+- 结构化动态卡牌字段与 `DynamicInstanceEncoder`。
+- `CardInstanceFusion`、动态辅助任务和训练框架原型。
+- `GameMemoryState`、双方 Ledger 和 Recent Events 接口原型。
+- Board token 化与 Transformer 接口原型。
 
-当前适配层已重写为清晰的接口壳，静态 artifacts 待 colleague 导出后正式挂载。
-
-### Replay 与 observation 基础设施
-
-- `data/observation_parser.py` 可以解析当前局面、可见卡牌、日志和合法选项。
-- `data/replay_dataset.py` 按每局真实 `steps` 读取变长 replay。
-- 训练样本来自 `observation.select` 非空的决策点。
-- `data/online_replay_importer.py` 支持每日 replay Dataset、日期保留集和有限样本导入。
-- 已验证的两个在线日期样例均无 parser error。
-- 已确认单样本可出现约 22 个卡牌实例、6 个合法选项，当前 token 规模约 43。
-
-## 当前原型的真实边界
-
-### 动态单卡表示
-
-当前已在正式源码实现：
-
-- 类别、数值、计数、布尔和 validity mask 分离的 `CardDynamicBatch`。
-- 保留 serial 的 HP、区域、12 类能量、异常状态、Tool、进化与本回合出场解析。
-- 分组编码并输出 64 维表示的 `DynamicInstanceEncoder`。
-- 由动态 query 查询独立 detail token 的四头 `CardInstanceFusion`。
-- 攻击可支付、分类型剩余能量、HP/伤害、zone/role 四项辅助任务。
-- 保守特殊能量 resolver、detail-level 标签、真实 replay collator 与扩展审计。
-- 唯一 `training.train_dynamic_card_fusion` 入口和 `kaggle_dynamic_training/` Kernel。
-
-仍待真实 Kaggle 结果证明：
-
-- 多日期 replay 字段覆盖率和 unresolved 比例。
-- 真实 batch forward/backward、四任务梯度和 tiny-batch overfit。
-- 时间保留集指标、能量反事实诊断和 checkpoint 回载一致性。
-- best/last checkpoint 与 CPU benchmark 的实际产物。
-
-### 时序与全局状态
-
-当前已有：
-
-- `GameMemoryState`、serial 记录、Recent Events 和两侧 Ledger 的最小接口。
-- `[STATE]`、`[DECISION]`、`[MATCH]`、Ledger/Event 投影和两层 Board Transformer 原型。
-
-当前缺口：
-
-- Ledger 目前主要是 serial 统计汇总，还不是按 `(owner, card_id)` 维护的长期认知表。
-- memory 缺少正式的 reset、clone、序列化、幂等更新和 shuffle 知识降级。
-- Board token 顺序与正式架构尚未完全一致。
-- `state_embedding` 目前来自通用池化，尚未固定为 `[STATE]` 的上下文化输出。
-- 尚未使用真实静态 artifacts 和在线 replay batch 形成正式动态 checkpoint。
-
-### 策略学习
-
-当前主线尚未实现：
-
-- ActionEncoder
-- 合法动作逐项评分
-- 行为克隆
-- Value Head
-- Oracle teacher / student distillation
-- Self-play PPO
-
-旧规则特征与共享 PPO 代码已经从当前仓库移除。失败原因和仍有价值的结论保存在 [实验结论记录](EXPERIMENT_HISTORY.md)，完整旧实现可从 Git 历史读取。
-
-## 接下来的完整顺序
-
-1. 从少量多日 replay 生成真实 decision-point 数据，固定字段覆盖率、Card ID/detail 对齐率、事件长度和特殊能量 unresolved 比例。
-2. 完成结构化 `CardDynamicBatch`、动态条件 detail Cross-Attention 和单卡辅助任务。
-3. 完成按 Card ID 聚合的双方 Ledger、Recent Events、幂等 memory 和正式 Board token 顺序。
-4. 用真实静态 artifacts 完成端到端 forward/backward、tiny-batch overfit、CPU benchmark 和融合 checkpoint。
-5. 增加 ActionEncoder，对引擎提供的变长合法选项逐项编码和评分。
-6. 先进行高质量 replay 行为克隆与 Value 学习，再进入 oracle 蒸馏和 self-play PPO。
-7. 在固定牌组、先后手、随机种子和历史 checkpoint 对手池上评估，最后构建提交包。
-
-## 数据划分规则
-
-- 静态卡牌任务：按 Card ID 划分，确保同一 Card ID 只属于一个 split。
-- Replay 任务：按完整 episode 和日期划分，确保同一局不会跨 split。
-- 最近若干日期作为时间保留集。
-- Oracle 或完整隐藏信息只作为未来 teacher 标签，正式 Agent 输入保持公开可见边界。
-
-## 当前唯一主线
+Board 的固定前缀顺序为：
 
 ```text
-colleague 静态 artifacts
-→ StaticCardAdapter 接入层
-→ 真实 replay 决策点
-→ 动态 CardInstanceFusion
-→ Ledger + Recent Events + Board Transformer
-→ ActionEncoder
-→ 行为克隆 / Value
-→ self-play
-→ submission
+[STATE]
+[DECISION]
+[MATCH]
+[SELF_LEDGER]
+[OPP_LEDGER]
+[RECENT_EVENT]*
+card instance tokens
 ```
 
-## 仓库清理结果
+`state_embedding` 取 Transformer 编码后的 `[STATE]`，即 `encoded[:, 0]`。
 
-- 当前仓库彻底清除了本地静态 CardEncoder、CardDataset 与 pre-processing 流程，相关逻辑移交给 `static_card/` 目录。
-- 根目录保留动态状态、时序全局 Board、replay 数据和未来策略学习所需的正式源码。
-- Kaggle 动态代码副本由 `scripts/sync_kaggle_dynamic_code_dataset.py` 生成（排除了已被清理的 static_detail_aggregator）。
-- 牌组资料统一放在 `decks/`。
+## 明确暂停项
+
+- `StaticCardAdapter.from_artifacts()` 在 contract 未配置时抛出 `StaticArtifactContractNotConfigured`。
+- 正式 adapter 不生成零 summary、假 detail 或自动 known 标记。
+- 动态训练 Kernel、训练入口和两个 benchmark 入口在运行前检查 `ready`，未接入即非零退出。
+- 旧静态路线已退出主线；历史实现只通过 Git 历史或明确标记的实验记录查阅。
+
+## 原型边界
+
+Board 和 memory 目前是接口原型。Ledger 尚未形成完整的长期认知表；memory 的 reset、clone、序列化、幂等更新和 shuffle 后知识降级仍需补齐。ActionEncoder、行为克隆、Value、蒸馏和 self-play 尚未进入正式主线。
+
+## 下一接入点
+
+收到 colleague 模块后，先确认 artifact contract 和 manifest，再实现 `StaticCardAdapter.from_artifacts()` 与 `forward_features()`。完成真实接入、对齐验证和端到端测试后，才恢复动态正式训练。

@@ -12,32 +12,26 @@ from models.board_transformer import BoardTransformer
 from models.card_instance_fusion import CardInstanceFusion
 from models.dynamic_instance_encoder import DynamicInstanceEncoder
 from models.dynamic_state_encoder import DynamicStateEncoder
-from models.static_card_adapter import StaticCardAdapter
+from models.static_card_adapter import StaticArtifactContractNotConfigured, StaticCardAdapter
+from tests.fakes.static_card_adapter import FakeStaticCardAdapter
 
 from tests.test_observation_parser import _observation
 
 
-def test_static_adapter_shell_interface() -> None:
-    adapter = StaticCardAdapter(embedding_dim=128, max_details=3, detail_dim=128)
-    card_ids = torch.tensor([21, 22, 0])
-    
-    features = adapter.forward_features(card_ids)
-    assert features.card_summary.shape == (3, 128)
-    assert features.detail_tokens.shape == (3, 3, 128)
-    assert features.detail_mask.shape == (3, 3)
-    assert features.detail_type_ids.shape == (3, 3)
-    assert features.known_mask.tolist() == [1.0, 1.0, 0.0]
-    
-    embedded, known = adapter(card_ids)
-    assert embedded.shape == (3, 128)
-    assert known.tolist() == [1.0, 1.0, 0.0]
+def test_static_adapter_fails_before_contract_integration() -> None:
+    adapter = StaticCardAdapter()
+    assert not adapter.ready
+    with pytest.raises(StaticArtifactContractNotConfigured):
+        adapter.forward_features(torch.tensor([21, 22, 0]))
+    with pytest.raises(StaticArtifactContractNotConfigured):
+        StaticCardAdapter.from_artifacts("unused")
 
 
 def test_board_tokenizer_and_transformer_shapes() -> None:
     parsed = parse_observation(_observation())
     memory = GameMemoryState().update_from_parsed(parsed)
     dynamic_batch = collate_card_dynamic(parsed.card_instances, memory.appearance_features(parsed.card_instances))
-    static_adapter = StaticCardAdapter(embedding_dim=128, max_details=4, detail_dim=128)
+    static_adapter = FakeStaticCardAdapter(torch.randn(2, 128), {"21": 0, "22": 1})
     static_embeddings, known = static_adapter(dynamic_batch.card_ids)
     dynamic_embeddings = DynamicInstanceEncoder()(dynamic_batch)
     instance_embeddings = CardInstanceFusion()(static_embeddings, dynamic_embeddings)
@@ -58,11 +52,10 @@ def test_board_tokenizer_and_transformer_shapes() -> None:
     assert set(tokenized.type_ids.flatten().tolist()) >= {0, 1, 2, 3, 4, 5}
     assert board.tokens.shape == tokenized.tokens.shape
     assert board.state_embedding.shape == (1, 128)
-    assert board.pooled.shape == (1, 128) # check alias works
 
 
 def test_dynamic_state_encoder_end_to_end() -> None:
-    adapter = StaticCardAdapter(embedding_dim=128, max_details=3, detail_dim=128)
+    adapter = FakeStaticCardAdapter(torch.randn(2, 128), {"21": 0, "22": 1})
     encoder = DynamicStateEncoder(adapter)
     output = encoder(_observation())
     assert output.board.state_embedding.shape == (1, 128)
@@ -72,7 +65,7 @@ def test_dynamic_state_encoder_end_to_end() -> None:
 
 
 def test_dynamic_state_encoder_handles_empty_observation() -> None:
-    adapter = StaticCardAdapter(embedding_dim=128, max_details=3, detail_dim=128)
+    adapter = FakeStaticCardAdapter(torch.randn(1, 128), {})
     encoder = DynamicStateEncoder(adapter)
     output = encoder({"current": None, "select": None, "logs": []})
     assert output.card_instance_embeddings.shape == (0, 128)

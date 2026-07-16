@@ -8,10 +8,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from data.dynamic_card_dataset import DynamicCardTrainingBatch
+from kaggle_dynamic_training import run_dynamic_card_training
 from data.replay_dataset import ReplayDatasetSummary
 from data.state_schema import AREA_IDS, CardInstanceState, collate_card_dynamic
 from models.dynamic_card_auxiliary import DynamicCardAuxiliaryOutput
-from models.static_card_adapter import StaticCardEmbeddingAdapter
+from models.static_card_adapter import StaticArtifactContractNotConfigured, StaticCardAdapter
+from tests.fakes.static_card_adapter import FakeStaticCardAdapter
 from training.train_dynamic_card_fusion import (
     DynamicCardTrainingModel,
     DynamicModelOutput,
@@ -21,9 +23,9 @@ from training.train_dynamic_card_fusion import (
     energy_counterfactual_diagnostic,
     instance_state_counterfactual_diagnostic,
     load_checkpoint,
+    require_static_adapter_ready,
     set_seed,
     split_metadata,
-    validate_static_adapter_alignment,
 )
 
 
@@ -85,6 +87,27 @@ def _output(unsupervised_value: float) -> DynamicModelOutput:
     )
 
 
+def test_dynamic_training_rejects_unconfigured_static_adapter() -> None:
+    adapter = StaticCardAdapter()
+    with pytest.raises(
+        StaticArtifactContractNotConfigured,
+        match="dynamic training is paused until colleague static artifacts",
+    ):
+        require_static_adapter_ready(adapter)
+    with pytest.raises(StaticArtifactContractNotConfigured):
+        DynamicCardTrainingModel(adapter, _config())
+
+
+def test_kaggle_runner_records_pause_reason(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(run_dynamic_card_training, "OUTPUT_ROOT", tmp_path)
+    with pytest.raises(StaticArtifactContractNotConfigured):
+        run_dynamic_card_training.main()
+    summary = json.loads((tmp_path / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["success"] is False
+    assert summary["error_type"] == "StaticArtifactContractNotConfigured"
+    assert summary["error"] == run_dynamic_card_training.PAUSE_REASON
+
+
 @pytest.mark.parametrize("unsupervised_value", [1000.0, float("nan"), float("inf")])
 def test_unresolved_attack_does_not_change_payment_losses(unsupervised_value: float) -> None:
     batch = _batch()
@@ -122,7 +145,7 @@ def test_dynamic_checkpoint_contains_required_state_and_reloads(tmp_path) -> Non
     details = torch.randn(2, 7, 128)
     masks = torch.ones(2, 7)
     types = torch.ones(2, 7, dtype=torch.long)
-    adapter = StaticCardEmbeddingAdapter(
+    adapter = FakeStaticCardAdapter(
         weight.clone(), {"21": 0, "22": 1}, freeze=True,
         detail_tokens=details.clone(), detail_mask=masks.clone(), detail_type_ids=types.clone(),
     )
@@ -159,7 +182,7 @@ def test_dynamic_checkpoint_contains_required_state_and_reloads(tmp_path) -> Non
     path = tmp_path / "checkpoint.pt"
     torch.save(payload, path)
 
-    adapter_two = StaticCardEmbeddingAdapter(
+    adapter_two = FakeStaticCardAdapter(
         weight.clone(), {"21": 0, "22": 1}, freeze=True,
         detail_tokens=details.clone(), detail_mask=masks.clone(), detail_type_ids=types.clone(),
     )
@@ -174,7 +197,7 @@ def test_fixed_seed_reproduces_dynamic_initialization() -> None:
     static_weight = torch.zeros(1, 128)
 
     def build() -> DynamicCardTrainingModel:
-        adapter = StaticCardEmbeddingAdapter(
+        adapter = FakeStaticCardAdapter(
             static_weight.clone(), {"21": 0}, freeze=True,
             detail_tokens=torch.zeros(1, 7, 128),
             detail_mask=torch.ones(1, 7),
@@ -189,73 +212,12 @@ def test_fixed_seed_reproduces_dynamic_initialization() -> None:
     assert all(torch.equal(left, right) for left, right in zip(first.parameters(), second.parameters()))
 
 
-def test_static_artifact_alignment_excludes_invalid_catalog_slots_and_is_numeric() -> None:
-    config = _config()
-    config["model"]["max_details"] = 3
-    adapter = StaticCardEmbeddingAdapter(
-        torch.zeros(1, 128),
-        {"21": 0},
-        freeze=True,
-        detail_tokens=torch.zeros(1, 3, 128),
-        detail_mask=torch.ones(1, 3),
-        detail_type_ids=torch.tensor([[1, 2, 3]]),
-    )
-    catalog = SimpleNamespace(
-        static_catalog=SimpleNamespace(
-            card_id_to_index={21: 0},
-            details_by_card_id={21: [
-                {"detail_index": 0, "detail_type": "attack", "attack_id": None},
-                {"detail_index": 1, "detail_type": "ability"},
-                {"detail_index": 2, "detail_type": "special_effect"},
-            ]},
-        ),
-        invalid_detail_slots=lambda card_id: {0},
-    )
-    result = validate_static_adapter_alignment(adapter, catalog, config)
-    assert result["shape_valid"]
-    assert result["catalog_invalid_slots_excluded"] == 1
-    assert result["card_coverage"] == 1.0
-    assert result["detail_slot_coverage"] == 1.0
-    assert result["coverage"] == 1.0
-    assert result["mismatch_examples"] == []
-
-
-def test_static_artifact_alignment_reports_type_order_and_nonfinite_tokens() -> None:
-    config = _config()
-    config["model"]["max_details"] = 2
-    tokens = torch.zeros(1, 2, 128)
-    tokens[0, 1, 0] = float("nan")
-    adapter = StaticCardEmbeddingAdapter(
-        torch.zeros(1, 128),
-        {"21": 0},
-        freeze=True,
-        detail_tokens=tokens,
-        detail_mask=torch.ones(1, 2),
-        detail_type_ids=torch.tensor([[2, 1]]),
-    )
-    catalog = SimpleNamespace(
-        static_catalog=SimpleNamespace(
-            card_id_to_index={21: 0},
-            details_by_card_id={21: [
-                {"detail_index": 0, "detail_type": "attack", "attack_id": 1},
-                {"detail_index": 1, "detail_type": "ability"},
-            ]},
-        ),
-        invalid_detail_slots=lambda card_id: set(),
-    )
-    result = validate_static_adapter_alignment(adapter, catalog, config)
-    assert result["card_coverage"] == 0.0
-    assert result["detail_slot_coverage"] < 1.0
-    assert result["nonfinite_valid_token_count"] == 1
-    assert result["mismatch_examples"][0]["kind"] == "card_alignment_mismatch"
-
-
 def test_energy_counterfactual_prefers_and_summarizes_supervised_candidates() -> None:
     config = _config()
     batch = _batch()
     batch.attack_costs[0, 0, 0] = 1.0
     batch.attack_costs[0, 1, 0] = 1.0
-    adapter = StaticCardEmbeddingAdapter(
+    adapter = FakeStaticCardAdapter(
         torch.zeros(1, 128),
         {"21": 0},
         freeze=True,
@@ -279,7 +241,7 @@ def test_trained_model_instance_state_counterfactuals_change_same_card_token() -
     config = _config()
     batch = _batch()
     batch.attack_costs[0, 0, 0] = 1.0
-    adapter = StaticCardEmbeddingAdapter(
+    adapter = FakeStaticCardAdapter(
         torch.zeros(1, 128),
         {"21": 0},
         freeze=True,

@@ -10,9 +10,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.benchmark_dynamic_card_fusion import main as benchmark_dynamic_card_fusion
+from models.static_card_adapter import StaticCardAdapter
+from training.train_dynamic_card_fusion import require_static_adapter_ready
 
 
 def main() -> None:
+    static_adapter = StaticCardAdapter()
+    require_static_adapter_ready(static_adapter)
     warnings.warn(
         "scripts/benchmark_dynamic_state.py is deprecated; forwarding to "
         "scripts/benchmark_dynamic_card_fusion.py with the same arguments",

@@ -42,14 +42,14 @@
 
 | 模块 | 状态 | 当前结果 |
 |---|---|---|
-| 静态卡牌表示 | 模块重构 | 静态卡牌特征、训练与导出完整采用 colleague 提供的脚本，根目录不再维护独立静态 pipeline |
+| 静态卡牌表示 | 等待导入 | 将完整采用 colleague 的 CSV 读取、聚合、特征、模型、训练和导出脚本；`static_card/` 当前仅为预留位置 |
 | Observation / replay 解析 | 初版完成 | 支持变长 replay、公开性边界和 decision sample 构造 |
 | 动态单卡表示 | 等待接入 | 结构化字段、动态 Cross-Attention 与辅助任务原型已实现，等待 colleague 静态产物接入 |
 | Ledger / Recent Events | 原型 | 已有最小记忆接口，正式长期认知与幂等更新待完成 |
 | Board Transformer | 原型 | 支持变长 [STATE]/[DECISION]/[MATCH]/Ledger/Event 及单卡实例表示，输出 state_embedding 提取完毕 |
 | ActionEncoder / 行为克隆 / Value / PPO | 尚未进入主线 | 旧 PPO 代码仅作为历史 baseline |
 
-当前处于静态模块替换阶段。静态卡牌特征已交由 `static_card/` colleague 脚本独立处理，当前仓库主要负责决策点 replay 解析、动态实例编码、Ledger 与全局 Board 状态以及后续的策略学习。动态训练等待 colleague 静态 artifacts 结构确定后接入 `StaticCardAdapter`。
+当前处于静态模块替换阶段。根仓库负责 replay、动态实例、memory、Board、动作和策略；`StaticCardAdapter` 是唯一跨模块边界。真实 artifact contract 尚未确定，因此正式动态训练和 benchmark 均会 fail-fast，不会生成虚构静态特征或静默继续训练。
 
 ```mermaid
 flowchart TD
@@ -71,7 +71,7 @@ flowchart TD
 ## 仓库结构
 
 ```text
-static_card/                 colleague 提供的完整静态卡牌模块 (CSV, 数据, 模型, 预训练与导出)
+static_card/                 colleague 完整静态模块的正式预留位置
 data/                        observation/replay 数据结构与解析，动态卡牌 dataset
 decks/                       原始牌组、Card ID 匹配结果与 baseline 牌组
 models/                      动态实例、单卡融合、Board Transformer 与 StaticCardAdapter 边界
@@ -95,7 +95,7 @@ docs/reference/              字段审计与事实资料
 
 下列内容保存在本地或 Kaggle，不提交到 GitHub：
 
-- `outputs/`：静态 embedding、detail tokens、metadata、checkpoint、日志和旧 agent 输出。
+- `outputs/`：本地运行输出、checkpoint、日志和评估结果。
 - `artifacts/`：CardRecord 与预处理缓存。
 - `data_from_submission/`：replay 样例、审计结果和 decision dataset。
 - `kaggle_cg_runtime_dataset/cg/`：`cg` Python runtime 与原生动态库。
@@ -115,7 +115,7 @@ docs/reference/              字段审计与事实资料
 测试：
 
 ```bash
-python -m pytest tests/ -q
+python -m pytest -q
 ```
 
 Kaggle 训练与部署命令集中维护在 [docs/KAGGLE_WORKFLOW.md](docs/KAGGLE_WORKFLOW.md)。

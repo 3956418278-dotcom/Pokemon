@@ -12,11 +12,6 @@ class BoardEncoderOutput:
     mask: torch.Tensor
     state_embedding: torch.Tensor
 
-    @property
-    def pooled(self) -> torch.Tensor:
-        """Alias for compatibility with older components."""
-        return self.state_embedding
-
 
 class BoardTransformer(nn.Module):
     def __init__(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import math
 import random
@@ -30,7 +29,10 @@ from data.state_schema import FIELD_ROLE_IDS, ZONE_IDS
 from models.card_instance_fusion import CardInstanceFusion, CardInstanceFusionOutput
 from models.dynamic_card_auxiliary import DynamicCardAuxiliaryHeads, DynamicCardAuxiliaryOutput
 from models.dynamic_instance_encoder import DynamicInstanceEncoder
-from models.static_card_adapter import StaticCardEmbeddingAdapter
+from models.static_card_adapter import (
+    StaticArtifactContractNotConfigured,
+    StaticCardAdapter,
+)
 from scripts.audit_replay_features import build_report, load_known_static_ids
 
 
@@ -68,9 +70,21 @@ class LossBundle:
         return getattr(self, name)
 
 
+PAUSE_REASON = (
+    "dynamic training is paused until colleague static artifacts "
+    "are integrated into StaticCardAdapter"
+)
+
+
+def require_static_adapter_ready(static_adapter: StaticCardAdapter) -> None:
+    if not static_adapter.ready:
+        raise StaticArtifactContractNotConfigured(PAUSE_REASON)
+
+
 class DynamicCardTrainingModel(nn.Module):
-    def __init__(self, static_adapter: StaticCardEmbeddingAdapter, config: dict[str, Any]) -> None:
+    def __init__(self, static_adapter: StaticCardAdapter, config: dict[str, Any]) -> None:
         super().__init__()
+        require_static_adapter_ready(static_adapter)
         model_config = config["model"]
         self.static_adapter = static_adapter
         for parameter in self.static_adapter.parameters():
@@ -115,7 +129,7 @@ class DynamicCardTrainingModel(nn.Module):
         batch.detail_exists_mask = effective_detail_exists
         dynamic_repr = self.dynamic_instance_encoder(dynamic_batch)
         fusion = self.card_instance_fusion(
-            static.summary,
+            static.card_summary,
             dynamic_repr,
             static.detail_tokens,
             effective_detail_mask,
@@ -369,175 +383,13 @@ def make_loader(
 
 
 def build_model(static_artifact_dir: Path, config: dict[str, Any], device: torch.device) -> DynamicCardTrainingModel:
-    adapter = StaticCardEmbeddingAdapter.from_artifacts(static_artifact_dir, freeze=True)
+    adapter = StaticCardAdapter()
+    require_static_adapter_ready(adapter)
     model = DynamicCardTrainingModel(adapter, config).to(device)
     return model
 
 
-DETAIL_TYPE_TO_ID = {"attack": 1, "ability": 2, "special_effect": 3}
-
-
-def validate_static_adapter_alignment(
-    adapter: StaticCardEmbeddingAdapter,
-    catalog: AttackCostCatalog,
-    config: dict[str, Any],
-    *,
-    mismatch_limit: int = 100,
-) -> dict[str, Any]:
-    """Validate the exported static tensors against catalog metadata and exclusions."""
-
-    expected_card_count = len(catalog.static_catalog.card_id_to_index)
-    expected_width = int(config["model"]["max_details"])
-    expected_dim = int(config["model"]["static_dim"])
-    summary = adapter.embedding.weight.detach()[1:]
-    detail_tokens = adapter.detail_tokens.detach()[1:] if adapter.detail_tokens is not None else None
-    detail_mask = adapter.detail_mask.detach()[1:] if adapter.detail_mask is not None else None
-    detail_type_ids = adapter.detail_type_ids.detach()[1:] if adapter.detail_type_ids is not None else None
-    shapes = {
-        "card_summary": list(summary.shape),
-        "detail_tokens": list(detail_tokens.shape) if detail_tokens is not None else None,
-        "detail_mask": list(detail_mask.shape) if detail_mask is not None else None,
-        "detail_type_ids": list(detail_type_ids.shape) if detail_type_ids is not None else None,
-    }
-    expected_shapes = {
-        "card_summary": [expected_card_count, expected_dim],
-        "detail_tokens": [expected_card_count, expected_width, expected_dim],
-        "detail_mask": [expected_card_count, expected_width],
-        "detail_type_ids": [expected_card_count, expected_width],
-    }
-    shape_checks = {
-        name: shapes[name] == expected
-        for name, expected in expected_shapes.items()
-    }
-    mismatch_examples: list[dict[str, Any]] = []
-
-    def mismatch(payload: dict[str, Any]) -> None:
-        if len(mismatch_examples) < mismatch_limit:
-            mismatch_examples.append(payload)
-
-    for name, valid in shape_checks.items():
-        if not valid:
-            mismatch({"kind": "shape_mismatch", "tensor": name, "actual": shapes[name], "expected": expected_shapes[name]})
-    if not all(shape_checks.values()) or detail_tokens is None or detail_mask is None or detail_type_ids is None:
-        return {
-            "schema_version": "static_artifact_detail_alignment_v1",
-            "shapes": shapes,
-            "expected_shapes": expected_shapes,
-            "shape_checks": shape_checks,
-            "shape_valid": False,
-            "checked_card_count": expected_card_count,
-            "aligned_card_count": 0,
-            "expected_valid_detail_slots": 0,
-            "actual_valid_detail_slots": 0,
-            "aligned_detail_slots": 0,
-            "catalog_invalid_slots_excluded": 0,
-            "nonfinite_valid_token_count": 0,
-            "card_coverage": 0.0,
-            "detail_slot_coverage": 0.0,
-            "coverage": 0.0,
-            "mismatch_count": len(mismatch_examples),
-            "mismatch_examples": mismatch_examples,
-        }
-
-    adapter_mapping = {int(card_id): int(index) for card_id, index in adapter.card_id_to_index.items()}
-    aligned_cards = 0
-    expected_slot_total = 0
-    actual_slot_total = 0
-    aligned_slot_total = 0
-    excluded_slot_total = 0
-    nonfinite_valid_tokens = 0
-    for card_id, catalog_index in sorted(catalog.static_catalog.card_id_to_index.items(), key=lambda item: item[1]):
-        card_mismatches: list[str] = []
-        adapter_index = adapter_mapping.get(int(card_id))
-        if adapter_index != int(catalog_index):
-            card_mismatches.append("card_index")
-        row_index = int(catalog_index)
-        metadata = catalog.static_catalog.details_by_card_id.get(int(card_id), [])
-        invalid_slots = set(catalog.invalid_detail_slots(card_id))
-        excluded_slot_total += len(invalid_slots)
-        expected_counts = Counter()
-        attack_ordinal = 0
-        for detail in metadata:
-            detail_type = str(detail.get("detail_type", "")).strip().lower()
-            if detail_type == "attack":
-                physical_slot = attack_ordinal
-                attack_ordinal += 1
-                if physical_slot in invalid_slots:
-                    continue
-            if detail_type in DETAIL_TYPE_TO_ID:
-                expected_counts[detail_type] += 1
-        expected_sequence = [
-            type_id
-            for detail_type, type_id in DETAIL_TYPE_TO_ID.items()
-            for _ in range(int(expected_counts[detail_type]))
-        ]
-        raw_positions = torch.nonzero(detail_mask[row_index] > 0, as_tuple=False).flatten().tolist()
-        effective_positions = [position for position in raw_positions if position not in invalid_slots]
-        actual_sequence = [int(detail_type_ids[row_index, position].item()) for position in effective_positions]
-        finite_by_position = [
-            bool(torch.isfinite(detail_tokens[row_index, position]).all().item())
-            for position in effective_positions
-        ]
-        nonfinite_valid_tokens += sum(not valid for valid in finite_by_position)
-        expected_slot_total += len(expected_sequence)
-        actual_slot_total += len(actual_sequence)
-        aligned_slot_total += sum(
-            actual_type == expected_type and finite
-            for actual_type, expected_type, finite in zip(actual_sequence, expected_sequence, finite_by_position)
-        )
-        if actual_sequence != expected_sequence:
-            card_mismatches.append("detail_type_count_or_group_order")
-        if not all(finite_by_position):
-            card_mismatches.append("nonfinite_valid_detail_token")
-        if not bool(torch.isfinite(summary[row_index]).all().item()):
-            card_mismatches.append("nonfinite_card_summary")
-        if card_mismatches:
-            mismatch({
-                "kind": "card_alignment_mismatch",
-                "card_id": int(card_id),
-                "catalog_index": int(catalog_index),
-                "adapter_index": adapter_index,
-                "reasons": card_mismatches,
-                "invalid_slots_excluded": sorted(invalid_slots),
-                "expected_type_counts": dict(expected_counts),
-                "expected_type_sequence": expected_sequence,
-                "actual_type_sequence": actual_sequence,
-                "effective_positions": effective_positions,
-            })
-        else:
-            aligned_cards += 1
-
-    card_coverage = aligned_cards / max(expected_card_count, 1)
-    detail_slot_coverage = aligned_slot_total / max(expected_slot_total, actual_slot_total, 1)
-    return {
-        "schema_version": "static_artifact_detail_alignment_v1",
-        "shapes": shapes,
-        "expected_shapes": expected_shapes,
-        "shape_checks": shape_checks,
-        "shape_valid": True,
-        "checked_card_count": expected_card_count,
-        "aligned_card_count": aligned_cards,
-        "expected_valid_detail_slots": expected_slot_total,
-        "actual_valid_detail_slots": actual_slot_total,
-        "aligned_detail_slots": aligned_slot_total,
-        "catalog_invalid_slots_excluded": excluded_slot_total,
-        "nonfinite_valid_token_count": nonfinite_valid_tokens,
-        "card_coverage": card_coverage,
-        "detail_slot_coverage": detail_slot_coverage,
-        "coverage": min(card_coverage, detail_slot_coverage),
-        "mismatch_count": expected_card_count - aligned_cards,
-        "mismatch_examples": mismatch_examples,
-    }
-
-
-def validate_static_artifact_alignment(
-    static_artifact_dir: Path,
-    catalog: AttackCostCatalog,
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    adapter = StaticCardEmbeddingAdapter.from_artifacts(static_artifact_dir, freeze=True)
-    return validate_static_adapter_alignment(adapter, catalog, config)
-
+# Static alignment validation will be restored with the colleague artifact contract.
 
 def _metric_sums(
     output: DynamicModelOutput,
@@ -792,38 +644,12 @@ def tiny_overfit(
     return result, gradient_result
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def artifact_versions(
-    static_dir: Path,
-    card_records: Path,
-    detail_metadata: Path,
-) -> dict[str, Any]:
-    paths = []
-    if static_dir.exists():
-        paths.extend(p for p in static_dir.iterdir() if p.is_file())
-    if card_records.exists():
-        paths.append(card_records)
-    if detail_metadata.exists():
-        paths.append(detail_metadata)
-    files = {
-        path.name: {"path": str(path), "sha256": _sha256(path), "size_bytes": path.stat().st_size}
-        for path in paths
-    }
-    source_manifest = Path(__file__).resolve().parents[1] / "source_manifest.json"
-    return {
-        "schema_version": "dynamic_artifact_versions_v1",
-        "static_files": files,
-        "dynamic_source_manifest": (
-            json.loads(source_manifest.read_text(encoding="utf-8")) if source_manifest.exists() else None
-        ),
-    }
+def artifact_versions(adapter_manifest: dict[str, Any] | None) -> dict[str, Any]:
+    if adapter_manifest is None:
+        raise StaticArtifactContractNotConfigured(
+            "StaticCardAdapter has not provided an artifact manifest"
+        )
+    return dict(adapter_manifest)
 
 
 def checkpoint_payload(
@@ -1468,6 +1294,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    static_adapter = StaticCardAdapter()
+    require_static_adapter_ready(static_adapter)
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     completed_stage = "configuration"
@@ -1509,7 +1337,7 @@ def main() -> None:
             "test": load_replay_collection(args.test_replay_dir, int(config["data"]["max_test_decisions"])),
         }
         replay_metadata = split_metadata(collections)
-        artifact_metadata = artifact_versions(args.static_artifact_dir, args.card_records, args.detail_metadata)
+        artifact_metadata = artifact_versions(None)
         run_config = {
             "config": config,
             "arguments": {
@@ -1535,17 +1363,6 @@ def main() -> None:
         combined = combine_collections(collections.values())
         known_ids = load_known_static_ids(args.static_artifact_dir / "card_id_to_index.json")
         audit = build_report(combined, known_ids, catalog)
-        static_alignment = validate_static_artifact_alignment(args.static_artifact_dir, catalog, config)
-        audit.setdefault("detail_alignment", {})["replay_metadata_coverage"] = audit.get(
-            "detail_alignment", {}
-        ).get("coverage")
-        audit["detail_alignment"].update({
-            "static_artifact": static_alignment,
-            "card_coverage": static_alignment["card_coverage"],
-            "detail_slot_coverage": static_alignment["detail_slot_coverage"],
-            "coverage": static_alignment["coverage"],
-            "mismatch_examples": static_alignment["mismatch_examples"],
-        })
         audit["split_summaries"] = replay_metadata["splits"]
         _write_json(args.output_dir / "audit" / "replay_feature_audit.json", audit)
 
