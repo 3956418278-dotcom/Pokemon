@@ -94,10 +94,10 @@ def parse_decks(text: str) -> list[dict[str, Any]]:
 
 
 def load_engine_cards() -> list[Any]:
-    cg_parent = ROOT / "outputs"
+    cg_parent = ROOT / "outputs/cg_runtime"
     if not (cg_parent / "cg" / "api.py").exists():
         raise FileNotFoundError(
-            "outputs/cg/api.py not found; download or extract the cg runtime into outputs/cg first"
+            "outputs/cg_runtime/cg/api.py not found; build or download the cg runtime first"
         )
     sys.path.insert(0, str(cg_parent))
     from cg.api import all_card_data

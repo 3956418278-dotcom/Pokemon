@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[3]
 
 CG_RUNTIME_B64 = """
 UEsDBBQAAAAIAAgH6lwAAAAAAgAAAAAAAAAOAAAAY2cvX19pbml0X18ucHkDAFBLAwQUAAAACAAOB+pcxGkorDMZ
@@ -30043,7 +30047,16 @@ Y2cvdXRpbHMucHlQSwUGAAAAAAkACQAGAgAA3zseAAAA
 
 
 def main() -> None:
-    work_dir = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path.cwd()
+    default_output = (
+        Path("/kaggle/working/outputs/cg_runtime")
+        if Path("/kaggle/working").exists()
+        else ROOT / "outputs/cg_runtime"
+    )
+    parser = argparse.ArgumentParser(description="Build the self-contained cg runtime.")
+    parser.add_argument("--output-dir", type=Path, default=default_output)
+    args = parser.parse_args()
+    work_dir = args.output_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
     payload = base64.b64decode("".join(CG_RUNTIME_B64.split()))
     with zipfile.ZipFile(BytesIO(payload)) as zf:
         zf.extractall(work_dir)

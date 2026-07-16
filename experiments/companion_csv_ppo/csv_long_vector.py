@@ -172,7 +172,7 @@ def _encode_row(
     return tuple(vector)
 
 
-@dataclass(slots=True)
+@dataclass
 class CardRegistry:
     """Mapping from canonical Card ID strings to fixed flat CSV vectors."""
 

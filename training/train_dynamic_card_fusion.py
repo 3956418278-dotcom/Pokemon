@@ -33,7 +33,10 @@ from models.static_card_adapter import (
     StaticArtifactContractNotConfigured,
     StaticCardAdapter,
 )
-from scripts.audit_replay_features import build_report, load_known_static_ids
+from data.replay_feature_audit import build_report, load_known_static_ids
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass
@@ -1288,7 +1291,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-replay-dir", type=Path, action="append", required=True)
     parser.add_argument("--validation-replay-dir", type=Path, action="append", required=True)
     parser.add_argument("--test-replay-dir", type=Path, action="append", required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/dynamic_card_fusion"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=ROOT / "outputs/dynamic_card_training",
+    )
     parser.add_argument("--resume", type=Path, default=None)
     return parser.parse_args()
 

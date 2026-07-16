@@ -3,11 +3,16 @@ from __future__ import annotations
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 
 import pytest
 
-from kaggle_ppo_csv_long_vector_test.csv_long_vector import (
+EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(EXPERIMENT_ROOT))
+
+from csv_long_vector import (
     SOURCE_COLUMNS,
     CardRegistry,
     CardRegistryError,

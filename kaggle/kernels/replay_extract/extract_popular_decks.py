@@ -26,6 +26,7 @@ COMPETITION = "pokemon-tcg-ai-battle"
 KAGGLE_INPUT = Path("/kaggle/input")
 KAGGLE_WORKING = Path("/kaggle/working")
 SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[3]
 
 RECENT_SUBMISSIONS_TO_USE = int(os.environ.get("PTCG_RECENT_SUBMISSIONS_TO_USE", "8"))
 SUBMISSION_PAGE_SIZE = int(os.environ.get("PTCG_SUBMISSION_PAGE_SIZE", "50"))
@@ -43,7 +44,11 @@ SUBMISSION_IDS = [
 
 
 def kaggle_paths() -> tuple[Path, Path, Path]:
-    working_dir = KAGGLE_WORKING if KAGGLE_WORKING.exists() else Path.cwd() / "popular_deck_outputs"
+    working_dir = (
+        KAGGLE_WORKING / "outputs/replay_extract"
+        if KAGGLE_WORKING.exists()
+        else ROOT / "outputs/replay_extract"
+    )
     temp_dir = Path("/kaggle/temp") if Path("/kaggle/temp").exists() else Path("/tmp")
     if not KAGGLE_WORKING.exists():
         temp_dir = working_dir / "tmp"
@@ -90,7 +95,7 @@ def find_card_data_csv() -> Path | None:
         KAGGLE_INPUT / "competitions" / "pokemon-tcg-ai-battle" / "EN_Card_Data.csv",
         KAGGLE_INPUT / "datasets" / "competitions" / "pokemon-tcg-ai-battle" / "EN_Card_Data.csv",
         SCRIPT_DIR / "EN_Card_Data.csv",
-        SCRIPT_DIR.parent / "EN_Card_Data.csv",
+        ROOT / "EN_Card_Data.csv",
     ]
     for path in candidates:
         if path.exists():
@@ -99,9 +104,15 @@ def find_card_data_csv() -> Path | None:
         matches = sorted(KAGGLE_INPUT.rglob("EN_Card_Data.csv"))
         if matches:
             return matches[0]
-    zip_path = SCRIPT_DIR.parent / "pokemon-tcg-ai-battle.zip"
+    zip_path = ROOT / "pokemon-tcg-ai-battle.zip"
     if zip_path.exists():
-        output = SCRIPT_DIR / "EN_Card_Data.csv"
+        output_root = (
+            KAGGLE_WORKING / "outputs/replay_extract"
+            if KAGGLE_WORKING.exists()
+            else ROOT / "outputs/replay_extract"
+        )
+        output = output_root / "card_data/EN_Card_Data.csv"
+        output.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path) as zf:
             with zf.open("EN_Card_Data.csv") as source:
                 output.write_bytes(source.read())
@@ -488,7 +499,7 @@ def run() -> None:
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     working_dir, _temp_dir, replay_dir = kaggle_paths()
-    output_dir = working_dir / "popular_deck_outputs"
+    output_dir = working_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     print("working dir:", working_dir.resolve())
     print("replay dir:", replay_dir.resolve())

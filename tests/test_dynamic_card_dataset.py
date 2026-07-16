@@ -10,7 +10,7 @@ import pytest
 from data.dynamic_card_dataset import AttackCostCatalog, StaticCardCatalog
 from data.replay_dataset import ReplayDatasetSummary
 from data.state_schema import AREA_IDS, CardInstanceState, GlobalSnapshot, ParsedObservation
-from scripts.audit_replay_features import build_report
+from data.replay_feature_audit import build_report
 
 
 def _catalog_files(tmp_path: Path) -> tuple[Path, Path, Path]:

@@ -4,6 +4,8 @@
 
 colleague 静态模块完整负责 CSV 读取、聚合、特征、模型、训练、评估和导出。`static_card/` 当前只是其未来落位目录。根仓库不维护替代静态实现，只通过 `StaticCardAdapter` 消费正式产物。
 
+正式依赖只允许 `scripts/` 和 `training/` 调用 `data/`、`models/`；正式模块不得反向导入 CLI。可复用 replay 审计位于 `data/replay_feature_audit.py`，`scripts/audit_replay_features.py` 只是命令行入口。
+
 正式依赖方向固定为：
 
 ```text

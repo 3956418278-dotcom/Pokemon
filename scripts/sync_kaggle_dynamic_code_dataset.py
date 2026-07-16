@@ -11,44 +11,28 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET = ROOT / "kaggle_dynamic_code_dataset"
+TARGET_RELATIVE = Path("kaggle/datasets/dynamic_code")
+TARGET = ROOT / TARGET_RELATIVE
+REPORT_DIR = ROOT / "outputs/dynamic_code_dataset"
 
-CANONICAL_FILES = [
-    "data/__init__.py",
-    "data/state_schema.py",
-    "data/observation_parser.py",
-    "data/game_memory.py",
-    "data/replay_dataset.py",
-    "data/online_replay_importer.py",
-    "data/dynamic_card_dataset.py",
-    "models/__init__.py",
-    "models/static_card_adapter.py",
-    "models/dynamic_instance_encoder.py",
-    "models/card_instance_fusion.py",
-    "models/dynamic_card_auxiliary.py",
-    "models/board_tokenizer.py",
-    "models/board_transformer.py",
-    "models/dynamic_state_encoder.py",
-    "training/__init__.py",
-    "training/train_dynamic_card_fusion.py",
-    "configs/dynamic_card_fusion.json",
-    "configs/dynamic_card_fusion_smoke.json",
-    "scripts/audit_replay_features.py",
-    "scripts/benchmark_dynamic_card_fusion.py",
-    "scripts/benchmark_dynamic_state.py",
-    "scripts/import_online_replay_decisions.py",
-    "tests/conftest.py",
-    "tests/test_observation_parser.py",
-    "tests/test_replay_dataset.py",
-    "tests/test_dynamic_card_dataset.py",
-    "tests/test_dynamic_card_models.py",
-    "tests/test_dynamic_training.py",
-]
+SOURCE_DIRECTORIES = ("data", "models", "training", "scripts", "configs", "tests")
+
+
+def _canonical_files() -> list[str]:
+    files = []
+    for directory in SOURCE_DIRECTORIES:
+        for path in (ROOT / directory).rglob("*"):
+            if path.is_file() and "__pycache__" not in path.parts and path.suffix in {".py", ".json"}:
+                files.append(path.relative_to(ROOT).as_posix())
+    return sorted(files)
+
+
+CANONICAL_FILES = _canonical_files()
 
 PUBLICATION_LINEAGE_FILES = [
-    "kaggle_dynamic_code_dataset/dataset-metadata.json",
-    "kaggle_dynamic_training/kernel-metadata.json",
-    "kaggle_dynamic_training/run_dynamic_card_training.py",
+    "kaggle/datasets/dynamic_code/dataset-metadata.json",
+    "kaggle/kernels/dynamic_training/kernel-metadata.json",
+    "kaggle/kernels/dynamic_training/run_dynamic_card_training.py",
 ]
 
 
@@ -68,19 +52,26 @@ def _git_output(*args: str) -> str:
         capture_output=True,
         text=True,
     )
-    return result.stdout.strip() if result.returncode == 0 else "unavailable"
+    return result.stdout.rstrip() if result.returncode == 0 else "unavailable"
 
 
 def _source_manifest() -> dict[str, object]:
     dirty_lines = _git_output("status", "--porcelain=v1", "--untracked-files=all").splitlines()
+    dirty_paths = [line[3:] if len(line) > 3 else line for line in dirty_lines]
+    existing_dirty_paths = [path for path in dirty_paths if (ROOT / path).exists()]
     return {
         "schema_version": "dynamic_code_source_manifest_v2",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_output("rev-parse", "HEAD"),
         "git_dirty": bool(dirty_lines),
-        "dirty_paths": [line[3:] if len(line) > 3 else line for line in dirty_lines],
+        "dirty_paths": existing_dirty_paths,
+        "deleted_dirty_path_count": len(dirty_paths) - len(existing_dirty_paths),
+        "source_root": ".",
+        "target_root": TARGET_RELATIVE.as_posix(),
         "files": {
             relative: {
+                "source_path": relative,
+                "target_path": (TARGET_RELATIVE / relative).as_posix(),
                 "sha256": _sha256(ROOT / relative),
                 "size_bytes": (ROOT / relative).stat().st_size,
             }
@@ -99,7 +90,8 @@ def _source_manifest() -> dict[str, object]:
 
 
 def sync() -> None:
-    for directory in ("data", "models", "training", "configs", "scripts", "tests"):
+    TARGET.mkdir(parents=True, exist_ok=True)
+    for directory in SOURCE_DIRECTORIES:
         shutil.rmtree(TARGET / directory, ignore_errors=True)
     for relative in CANONICAL_FILES:
         source = ROOT / relative
@@ -109,6 +101,15 @@ def sync() -> None:
         print(f"synced {relative}")
     (TARGET / "source_manifest.json").write_text(
         json.dumps(_source_manifest(), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    (REPORT_DIR / "last_sync.json").write_text(
+        json.dumps(
+            {"target_root": TARGET_RELATIVE.as_posix(), "file_count": len(CANONICAL_FILES)},
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
     print("wrote source_manifest.json")
@@ -131,11 +132,19 @@ def check() -> bool:
         print("dynamic code dataset is missing source_manifest.json")
         return False
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("source_root") != "." or manifest.get("target_root") != TARGET_RELATIVE.as_posix():
+        print("dynamic code source manifest records incorrect source or target roots")
+        return False
     recorded_files = manifest.get("files", {})
     hash_mismatches = [
         relative
         for relative in CANONICAL_FILES
-        if recorded_files.get(relative, {}).get("sha256") != _sha256(ROOT / relative)
+        if (
+            recorded_files.get(relative, {}).get("source_path") != relative
+            or recorded_files.get(relative, {}).get("target_path")
+            != (TARGET_RELATIVE / relative).as_posix()
+            or recorded_files.get(relative, {}).get("sha256") != _sha256(ROOT / relative)
+        )
     ]
     if hash_mismatches:
         print("dynamic code source manifest has stale hashes:")

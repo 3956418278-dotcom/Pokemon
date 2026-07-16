@@ -53,7 +53,11 @@ def main() -> None:
     parser.add_argument("--submission-page-size", type=int, default=20)
     parser.add_argument("--max-replays", type=int, default=40)
     parser.add_argument("--download-sleep", type=float, default=0.5)
-    parser.add_argument("--output-dir", type=Path, default=Path("data_from_submission/online_replays"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=ROOT / "outputs/replay_extract/online_replays",
+    )
     parser.add_argument(
         "--episodes-index-dir",
         type=Path,

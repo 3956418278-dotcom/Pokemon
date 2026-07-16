@@ -25,7 +25,6 @@ static_card/outputs/
 static_card/artifacts/
 static_card/checkpoints/
 static_card/logs/
-kaggle_dynamic_state_tests_output*/
 data_from_submission/replay_audit/
 data_from_submission/replay_dataset/
 data_from_submission/replays/
@@ -39,22 +38,16 @@ data_from_submission/replays/
 # Kaggle / competition downloads and extracted runtimes
 pokemon-tcg-ai-battle.zip
 cri_rulebook_en.pdf
-kaggle_cg_runtime_dataset/cg/
-kaggle_cg_runtime/__pycache__/
-kaggle_kernel/__pycache__/
+kaggle/datasets/cg_runtime/cg/
 
 # Generated or duplicated self-contained kernel source snapshots
-kaggle_card_pretrain/data/
-kaggle_card_pretrain/models/
-kaggle_card_pretrain/training/
-kaggle_card_pretrain/configs/
-kaggle_dynamic_code_dataset/data/
-kaggle_dynamic_code_dataset/models/
-kaggle_dynamic_code_dataset/scripts/
-kaggle_dynamic_code_dataset/training/
-kaggle_dynamic_code_dataset/configs/
-kaggle_dynamic_code_dataset/tests/
-kaggle_dynamic_code_dataset/source_manifest.json
+kaggle/datasets/dynamic_code/data/
+kaggle/datasets/dynamic_code/models/
+kaggle/datasets/dynamic_code/training/
+kaggle/datasets/dynamic_code/scripts/
+kaggle/datasets/dynamic_code/configs/
+kaggle/datasets/dynamic_code/tests/
+kaggle/datasets/dynamic_code/source_manifest.json
 
 # Collaboration/local agent state
 .agents/

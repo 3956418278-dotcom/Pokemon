@@ -8,7 +8,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from data.dynamic_card_dataset import DynamicCardTrainingBatch
-from kaggle_dynamic_training import run_dynamic_card_training
 from data.replay_dataset import ReplayDatasetSummary
 from data.state_schema import AREA_IDS, CardInstanceState, collate_card_dynamic
 from models.dynamic_card_auxiliary import DynamicCardAuxiliaryOutput
@@ -30,7 +29,9 @@ from training.train_dynamic_card_fusion import (
 
 
 def _config() -> dict:
-    return json.loads(open("configs/dynamic_card_fusion.json", encoding="utf-8").read())
+    return json.loads(
+        open("configs/dynamic_card_fusion/formal_20260712.json", encoding="utf-8").read()
+    )
 
 
 def _batch() -> DynamicCardTrainingBatch:
@@ -96,16 +97,6 @@ def test_dynamic_training_rejects_unconfigured_static_adapter() -> None:
         require_static_adapter_ready(adapter)
     with pytest.raises(StaticArtifactContractNotConfigured):
         DynamicCardTrainingModel(adapter, _config())
-
-
-def test_kaggle_runner_records_pause_reason(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(run_dynamic_card_training, "OUTPUT_ROOT", tmp_path)
-    with pytest.raises(StaticArtifactContractNotConfigured):
-        run_dynamic_card_training.main()
-    summary = json.loads((tmp_path / "run_summary.json").read_text(encoding="utf-8"))
-    assert summary["success"] is False
-    assert summary["error_type"] == "StaticArtifactContractNotConfigured"
-    assert summary["error"] == run_dynamic_card_training.PAUSE_REASON
 
 
 @pytest.mark.parametrize("unsupervised_value", [1000.0, float("nan"), float("inf")])

@@ -78,12 +78,15 @@ models/                      动态实例、单卡融合、Board Transformer 与
 training/                    动态融合模型训练与评估
 scripts/                     数据审计、牌组构造、benchmark 与 Kaggle 辅助脚本
 tests/                       动态模型、观察解析、replay 相关的单元测试
+configs/                     日期化的动态训练配置
+experiments/                 与当前主线隔离的历史实验
 
-kaggle_cg_runtime/           构建 cg runtime Dataset 的自包含 kernel
-kaggle_cg_runtime_dataset/   cg runtime Dataset metadata
-kaggle_dynamic_code_dataset/ 动态代码 Dataset metadata；代码由同步脚本生成
-kaggle_dynamic_training/     唯一正式动态单卡训练 Kernel
-kaggle_extract/              公开 replay 与热门牌组提取 kernel
+kaggle/
+├── builders/cg_runtime/     构建 cg runtime 的自包含 Kernel
+├── datasets/cg_runtime/     cg runtime Dataset metadata 与本地生成内容
+├── datasets/dynamic_code/   动态代码 Dataset metadata 与同步生成内容
+├── kernels/replay_extract/  replay 与热门牌组提取 Kernel
+└── kernels/dynamic_training/动态单卡训练 Kernel（当前暂停）
 
 docs/                        当前文档
 docs/reference/              字段审计与事实资料
@@ -95,10 +98,10 @@ docs/reference/              字段审计与事实资料
 
 下列内容保存在本地或 Kaggle，不提交到 GitHub：
 
-- `outputs/`：本地运行输出、checkpoint、日志和评估结果。
+- `outputs/`：按 `replay_extract/`、`dynamic_code_dataset/`、`dynamic_card_training/`、`benchmarks/` 和 `cg_runtime/` 分组的本地生成内容。
 - `artifacts/`：CardRecord 与预处理缓存。
 - `data_from_submission/`：replay 样例、审计结果和 decision dataset。
-- `kaggle_cg_runtime_dataset/cg/`：`cg` Python runtime 与原生动态库。
+- `kaggle/datasets/cg_runtime/cg/`：用于发布的 `cg` Python runtime 与原生动态库。
 
 这些文件的生成和挂载方式见 [Kaggle 工作流](docs/KAGGLE_WORKFLOW.md)。
 
@@ -117,5 +120,13 @@ docs/reference/              字段审计与事实资料
 ```bash
 python -m pytest -q
 ```
+
+独立历史实验测试：
+
+```bash
+python -m pytest experiments/companion_csv_ppo/tests -q
+```
+
+项目采用 [MIT License](LICENSE)。
 
 Kaggle 训练与部署命令集中维护在 [docs/KAGGLE_WORKFLOW.md](docs/KAGGLE_WORKFLOW.md)。

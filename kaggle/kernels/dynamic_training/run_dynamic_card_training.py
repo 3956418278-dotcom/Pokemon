@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -19,7 +20,12 @@ PAUSE_REASON = (
     "dynamic training is paused until colleague static artifacts "
     "are integrated into StaticCardAdapter"
 )
-OUTPUT_ROOT = Path("/kaggle/working/outputs")
+DEFAULT_OUTPUT_ROOT = (
+    Path("/kaggle/working/outputs/dynamic_card_training")
+    if Path("/kaggle/working").exists()
+    else ROOT / "outputs/dynamic_card_training"
+)
+OUTPUT_ROOT = Path(os.environ.get("PTCG_DYNAMIC_OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
 
 
 def main() -> None:

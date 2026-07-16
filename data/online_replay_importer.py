@@ -10,6 +10,9 @@ from typing import Any, Protocol
 from .replay_dataset import ReplayDecisionDataset
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 COMPETITION = "pokemon-tcg-ai-battle"
 
 
@@ -54,7 +57,7 @@ class OnlineReplayImportConfig:
     daily_dataset_mount_root: Path = Path("/kaggle/input")
     reserve_recent_days: int = 0
     import_split: str = "train"
-    output_dir: Path = Path("data_from_submission/online_replays")
+    output_dir: Path = ROOT / "outputs/replay_extract/online_replays"
 
 
 class ReplayApiClient(Protocol):

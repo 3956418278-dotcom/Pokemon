@@ -27,7 +27,11 @@ def main() -> None:
     parser.add_argument("--card-records", type=Path, required=True)
     parser.add_argument("--detail-metadata", type=Path, required=True)
     parser.add_argument("--decision-samples", type=int, default=8)
-    parser.add_argument("--output", type=Path, default=Path("outputs/benchmark/benchmark.json"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=ROOT / "outputs/benchmarks/dynamic_card_fusion.json",
+    )
     args = parser.parse_args()
 
     config = json.loads(args.config.read_text(encoding="utf-8"))

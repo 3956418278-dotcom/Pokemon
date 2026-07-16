@@ -18,8 +18,6 @@
     "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-11"
   ],
   "competition_sources": [],
-  "kernel_sources": [
-    "f7e6n5g4/ptcg-card-pretrain"
-  ],
+  "kernel_sources": [],
   "model_sources": []
 }
