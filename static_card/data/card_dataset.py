@@ -17,24 +17,26 @@ PAD_TOKEN = "<PAD>"
 NULL_TOKEN = "<NULL>"
 UNK_TOKEN = "<UNK>"
 MASK_TOKEN = "<MASK>"
-SPECIAL_TOKENS = [PAD_TOKEN, NULL_TOKEN, UNK_TOKEN, MASK_TOKEN]
-SCHEMA_VERSION = 6
+SPECIAL_TOKENS = [PAD_TOKEN, NULL_TOKEN, UNK_TOKEN]
+DETAIL_SPECIAL_TOKENS = [*SPECIAL_TOKENS, MASK_TOKEN]
+SCHEMA_VERSION = 8
 TOKEN_PATTERN = re.compile(r"\{[^}]+\}|[^\W_]+(?:['’][^\W_]+)*|\d+|[^\w\s]", re.UNICODE)
 
 
 def _normalized(value: Any) -> str:
     if value is None:
         return NULL_TOKEN
-    text = unicodedata.normalize("NFKC", str(value)).replace("\xa0", " ")
+    text = unicodedata.normalize("NFC", str(value)).replace("\xa0", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return NULL_TOKEN if not text or text.casefold() in {"n/a", "nan", "none", "-", "—"} else text
 
 
-def _vocab(values: Iterable[Any]) -> dict[str, int]:
+def _vocab(values: Iterable[Any], *, include_mask: bool = False) -> dict[str, int]:
+    special_tokens = DETAIL_SPECIAL_TOKENS if include_mask else SPECIAL_TOKENS
     normalized = {_normalized(value) for value in values}
-    normalized.difference_update(SPECIAL_TOKENS)
+    normalized.difference_update(DETAIL_SPECIAL_TOKENS)
     ordered = sorted(normalized, key=lambda value: (value.casefold(), value))
-    return {value: index for index, value in enumerate([*SPECIAL_TOKENS, *ordered])}
+    return {value: index for index, value in enumerate([*special_tokens, *ordered])}
 
 
 def _id(vocab: dict[str, int], value: Any) -> int:
@@ -59,50 +61,50 @@ def _normalize_number(value: Any, stats: dict[str, float]) -> float:
     return 0.0 if value is None else (float(value) - stats["mean"]) / stats["std"]
 
 
-def _raw_category(record: dict[str, Any]) -> str | None:
-    value = (record.get("source_fields") or {}).get("Category")
-    return value if _normalized(value) != NULL_TOKEN else None
-
-
 def make_feature_schema(records: list[dict[str, Any]], details: list[dict[str, Any]]) -> dict[str, Any]:
     detail_names = [detail.get("detail_name") for detail in details]
-    identities = [f"{detail.get('detail_type')}::{_normalized(detail.get('detail_name'))}" for detail in details]
     text_tokens = [token for detail in details for token in _tokens(detail.get("text"))]
+    name_values = [
+        value
+        for record in records
+        for value in [record.get("name"), record.get("evolves_from"), *(record.get("evolves_to") or [])]
+    ]
     schema = {
         "schema_version": SCHEMA_VERSION,
-        "energy_types": list(ENERGY_TYPES),
-        "name_vocab": _vocab(record.get("name") for record in records),
-        "major_role_vocab": _vocab(record.get("category") for record in records),
+        "non_detail_card_fields": [
+            "name_id", "card_type_id", "stage_id", "rule_id", "category_id", "type_id",
+            "weakness_type_id", "resistance_type_id", "hp_normalized", "hp_mask",
+            "retreat_normalized", "retreat_mask", "evolves_from_name_id", "evolves_from_mask",
+            "evolves_to_name_ids",
+        ],
+        "non_detail_batch_fields": [
+            "name_ids", "card_type_ids", "stage_ids", "rule_ids", "category_ids", "type_ids",
+            "weakness_type_ids", "resistance_type_ids", "hp_normalized", "hp_mask",
+            "retreat_normalized", "retreat_mask", "evolves_from_name_ids", "evolves_from_mask",
+            "evolves_to_name_ids", "evolves_to_mask",
+        ],
+        "attack_energy_types": list(ENERGY_TYPES),
+        "name_vocab": _vocab(name_values),
         "card_type_vocab": _vocab(record.get("card_type") for record in records),
-        "subtype_vocab": _vocab(record.get("subtype") for record in records),
         "stage_vocab": _vocab(record.get("stage") for record in records),
-        "rule_flag_vocab": _vocab(flag for record in records for flag in record.get("rule_flags") or []),
-        "category_vocab": _vocab(_raw_category(record) for record in records),
-        "evolution_name_vocab": _vocab(
+        "rule_vocab": _vocab(record.get("rule") for record in records),
+        "category_vocab": _vocab(record.get("category") for record in records),
+        "type_vocab": _vocab(
             value
             for record in records
-            for value in [record.get("evolves_from"), *(record.get("evolves_to") or [])]
+            for value in [record.get("type"), record.get("weakness_type"), record.get("resistance_type")]
         ),
-        "hp_applicability_vocab": _vocab(record.get("hp_applicability") for record in records),
-        "energy_type_vocab": _vocab(
-            value
-            for record in records
-            for value in [record.get("pokemon_type"), record.get("weakness_type"), record.get("resistance_type"), *(record.get("provided_energy_types") or [])]
-        ),
-        "provided_energy_mode_vocab": _vocab(record.get("provided_energy_mode") for record in records),
-        "attachment_restriction_vocab": _vocab(record.get("attachment_restriction") for record in records),
-        "invalid_attachment_effect_vocab": _vocab(record.get("invalid_attachment_effect") for record in records),
-        "detail_type_vocab": _vocab(detail.get("detail_type") for detail in details),
-        "detail_subtype_vocab": _vocab(detail.get("detail_subtype") for detail in details),
-        "detail_name_vocab": _vocab(detail_names),
-        "detail_identity_vocab": _vocab(identities),
-        "detail_text_vocab": _vocab(text_tokens),
-        "damage_mode_vocab": _vocab(detail.get("damage_mode") for detail in details),
-        "normalization": {
-            "hp": _stats(record.get("hp") for record in records),
-            "retreat": _stats(record.get("retreat_cost") for record in records),
-            "weakness_value": _stats(record.get("weakness_value") for record in records),
-            "resistance_value": _stats(record.get("resistance_value") for record in records),
+        "numeric_scaling": {
+            "mode": "fixed_divisors",
+            "hp_divisor": 100.0,
+            "retreat_divisor": 4.0,
+        },
+        "detail_type_vocab": _vocab((detail.get("detail_type") for detail in details), include_mask=True),
+        "detail_subtype_vocab": _vocab((detail.get("detail_subtype") for detail in details), include_mask=True),
+        "detail_name_vocab": _vocab(detail_names, include_mask=True),
+        "detail_text_vocab": _vocab(text_tokens, include_mask=True),
+        "damage_mode_vocab": _vocab((detail.get("damage_mode") for detail in details), include_mask=True),
+        "detail_normalization": {
             "attack_damage": _stats(
                 detail.get("damage_base")
                 for detail in details
@@ -117,85 +119,43 @@ def make_feature_schema(records: list[dict[str, Any]], details: list[dict[str, A
 
 def _schema_valid(schema: dict[str, Any], records: list[dict[str, Any]], details: list[dict[str, Any]]) -> bool:
     required = {
-        "name_vocab", "major_role_vocab", "card_type_vocab", "subtype_vocab", "stage_vocab",
-        "rule_flag_vocab", "category_vocab", "evolution_name_vocab", "detail_text_vocab",
+        "name_vocab", "card_type_vocab", "stage_vocab", "rule_vocab", "category_vocab", "type_vocab",
+        "numeric_scaling", "detail_text_vocab", "detail_normalization",
     }
     return (
         schema.get("schema_version") == SCHEMA_VERSION
         and schema.get("card_count") == len(records)
         and schema.get("detail_count") == len(details)
+        and schema.get("numeric_scaling", {}).get("mode") == "fixed_divisors"
         and required <= schema.keys()
     )
 
 
-def _multi_hot(vocab: dict[str, int], values: Iterable[Any]) -> list[float]:
-    result = [0.0] * len(vocab)
-    for value in values:
-        index = _id(vocab, value)
-        if index != vocab[PAD_TOKEN]:
-            result[index] = 1.0
-    return result
-
-
 def encode_card(record: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
-    provided_allowed = set(
-        str(value) for value in record.get("provided_energy_allowed_types", record.get("provided_energy_types")) or []
-    )
-    provided_counts = record.get("provided_energy_counts")
-    if provided_counts is None:
-        legacy_counts = {energy: 0 for energy in ENERGY_TYPES}
-        for energy in record.get("provided_energy_types") or []:
-            if energy in legacy_counts:
-                legacy_counts[energy] += 1
-        provided_counts = [legacy_counts[energy] for energy in ENERGY_TYPES]
-    has_provided = record.get("card_type") in {"BASIC_ENERGY", "SPECIAL_ENERGY"}
-    provided_energy_amount = record.get("provided_energy_amount")
     evolves_from = record.get("evolves_from")
     evolves_to = list(record.get("evolves_to") or [])
     hp = record.get("hp")
     retreat = record.get("retreat_cost")
-    weakness_value = record.get("weakness_value")
-    resistance_value = record.get("resistance_value")
-    pokemon_type = record.get("pokemon_type")
+    type_value = record.get("type")
     weakness_type = record.get("weakness_type")
     resistance_type = record.get("resistance_type")
-    stats = schema["normalization"]
+    scaling = schema["numeric_scaling"]
     return {
         "name_id": _id(schema["name_vocab"], record.get("name")),
-        "major_role_id": _id(schema["major_role_vocab"], record.get("category")),
         "card_type_id": _id(schema["card_type_vocab"], record.get("card_type")),
-        "subtype_id": _id(schema["subtype_vocab"], record.get("subtype")),
         "stage_id": _id(schema["stage_vocab"], record.get("stage")),
-        "rule_flags": _multi_hot(schema["rule_flag_vocab"], record.get("rule_flags") or []),
-        "category_id": _id(schema["category_vocab"], _raw_category(record)),
-        "evolves_from_id": _id(schema["evolution_name_vocab"], evolves_from),
-        "evolves_from_mask": float(evolves_from is not None),
-        "evolves_to_ids": [_id(schema["evolution_name_vocab"], value) for value in evolves_to],
-        "hp": float(hp or 0),
-        "hp_normalized": _normalize_number(hp, stats["hp"]),
+        "rule_id": _id(schema["rule_vocab"], record.get("rule")),
+        "category_id": _id(schema["category_vocab"], record.get("category")),
+        "type_id": _id(schema["type_vocab"], type_value),
+        "weakness_type_id": _id(schema["type_vocab"], weakness_type),
+        "resistance_type_id": _id(schema["type_vocab"], resistance_type),
+        "hp_normalized": 0.0 if hp is None else float(hp) / scaling["hp_divisor"],
         "hp_mask": float(hp is not None),
-        "hp_applicability_id": _id(schema["hp_applicability_vocab"], record.get("hp_applicability")),
-        "pokemon_type_id": _id(schema["energy_type_vocab"], pokemon_type),
-        "pokemon_type_mask": float(pokemon_type is not None),
-        "provided_energy_counts": [float(value) for value in provided_counts[: len(ENERGY_TYPES)]],
-        "provided_energy_allowed_type_mask": [float(energy in provided_allowed) for energy in ENERGY_TYPES],
-        "provided_energy_amount": float(provided_energy_amount or 0),
-        "provided_energy_amount_mask": float(provided_energy_amount is not None),
-        "provided_energy_mode_id": _id(schema["provided_energy_mode_vocab"], record.get("provided_energy_mode")),
-        "attachment_restriction_id": _id(schema["attachment_restriction_vocab"], record.get("attachment_restriction")),
-        "invalid_attachment_effect_id": _id(schema["invalid_attachment_effect_vocab"], record.get("invalid_attachment_effect")),
-        "provided_energy_mask": float(has_provided),
-        "weakness_type_id": _id(schema["energy_type_vocab"], weakness_type),
-        "weakness_value": float(weakness_value or 0),
-        "weakness_normalized": _normalize_number(weakness_value, stats["weakness_value"]),
-        "weakness_mask": float(weakness_type is not None or weakness_value is not None),
-        "resistance_type_id": _id(schema["energy_type_vocab"], resistance_type),
-        "resistance_value": float(resistance_value or 0),
-        "resistance_normalized": _normalize_number(resistance_value, stats["resistance_value"]),
-        "resistance_mask": float(resistance_type is not None or resistance_value is not None),
-        "retreat": float(retreat or 0),
-        "retreat_normalized": _normalize_number(retreat, stats["retreat"]),
+        "retreat_normalized": 0.0 if retreat is None else float(retreat) / scaling["retreat_divisor"],
         "retreat_mask": float(retreat is not None),
+        "evolves_from_name_id": _id(schema["name_vocab"], evolves_from),
+        "evolves_from_mask": float(evolves_from is not None),
+        "evolves_to_name_ids": [_id(schema["name_vocab"], value) for value in evolves_to],
     }
 
 
@@ -206,17 +166,16 @@ def encode_detail(detail: dict[str, Any], schema: dict[str, Any]) -> dict[str, A
     damage = detail.get("damage_base") if is_attack else None
     text_ids = [_id(schema["detail_text_vocab"], token) for token in _tokens(detail.get("text"))]
     return {
-        "detail_index": int(detail.get("detail_index", -1)),
+        "detail_id": int(detail.get("detail_id", detail.get("detail_index", -1))),
         "detail_type_id": _id(schema["detail_type_vocab"], detail_type),
         "detail_subtype_id": _id(schema["detail_subtype_vocab"], detail.get("detail_subtype")),
         "detail_name_id": _id(schema["detail_name_vocab"], detail_name),
-        "detail_identity_id": _id(schema["detail_identity_vocab"], f"{detail_type}::{detail_name}"),
         "detail_text_ids": text_ids,
         "attack_energy_counts": [float(value) for value in (detail.get("energy_counts") or [0] * 12)[:12]] if is_attack else [0.0] * 12,
         "attack_energy_mask": float(is_attack),
         "damage_raw": float(damage or 0),
         "damage_raw_text": detail.get("damage_raw"),
-        "damage_normalized": _normalize_number(damage, schema["normalization"]["attack_damage"]),
+        "damage_normalized": _normalize_number(damage, schema["detail_normalization"]["attack_damage"]),
         "damage_mode_id": _id(schema["damage_mode_vocab"], detail.get("damage_mode") if is_attack else None),
         "damage_mask": float(is_attack and damage is not None),
         "attack_id": int(detail.get("attack_id") or 0),
@@ -242,6 +201,15 @@ class CardDataset(Dataset):
         self.schema = schema
         self.indices = list(range(len(records))) if indices is None else list(indices)
         self.manifest = manifest or {}
+        if len(detail_offsets) != len(records) + 1:
+            raise ValueError("detail_offsets must contain one boundary per card plus the final boundary")
+        for index, record in enumerate(records):
+            start, end = detail_offsets[index : index + 2]
+            expected_ids = list(range(start, end))
+            if record.get("detail_ids") != expected_ids:
+                raise ValueError(f"card {record.get('card_id')} has inconsistent detail_ids")
+            if any(details[detail_id].get("detail_id") != detail_id for detail_id in expected_ids):
+                raise ValueError(f"card {record.get('card_id')} points to an invalid detail_id")
 
     @classmethod
     def from_cache(cls, cache_dir: Path = DEFAULT_CACHE_DIR, rebuild: bool = False) -> "CardDataset":
@@ -265,71 +233,55 @@ class CardDataset(Dataset):
     def __getitem__(self, item: int) -> dict[str, Any]:
         index = self.indices[item]
         record = self.records[index]
-        start, end = self.detail_offsets[index : index + 2]
         return {
             "index": index,
             "card_id": str(record["card_id"]),
+            "record": record,
             "card": encode_card(record, self.schema),
-            "details": [encode_detail(detail, self.schema) for detail in self.details[start:end]],
+            "details": [encode_detail(self.details[detail_id], self.schema) for detail_id in record["detail_ids"]],
         }
-
-
-def _tensor(items: list[dict[str, Any]], path: tuple[str, ...], dtype: torch.dtype) -> torch.Tensor:
-    values: list[Any] = []
-    for item in items:
-        value: Any = item
-        for key in path:
-            value = value[key]
-        values.append(value)
-    return torch.tensor(values, dtype=dtype)
 
 
 def collate_cards(items: list[dict[str, Any]]) -> dict[str, Any]:
     if not items:
         raise ValueError("cannot collate an empty card batch")
     cards = [item["card"] for item in items]
-    max_evolves = max(1, max(len(card["evolves_to_ids"]) for card in cards))
+    max_evolves = max(1, max(len(card["evolves_to_name_ids"]) for card in cards))
     max_details = max(1, max(len(item["details"]) for item in items))
     max_text = max(1, max((len(detail["detail_text_ids"]) for item in items for detail in item["details"]), default=0))
 
-    batch: dict[str, Any] = {
-        "card_indices": torch.tensor([item["index"] for item in items], dtype=torch.long),
-        "card_ids": [item["card_id"] for item in items],
-    }
+    batch: dict[str, Any] = {}
     scalar_long = {
-        "name_ids": "name_id", "major_role_ids": "major_role_id", "card_type_ids": "card_type_id",
-        "subtype_ids": "subtype_id", "stage_ids": "stage_id", "category_ids": "category_id",
-        "evolves_from_ids": "evolves_from_id", "hp_applicability_ids": "hp_applicability_id",
-        "pokemon_type_ids": "pokemon_type_id", "weakness_type_ids": "weakness_type_id",
-        "resistance_type_ids": "resistance_type_id",
-        "provided_energy_mode_ids": "provided_energy_mode_id",
-        "attachment_restriction_ids": "attachment_restriction_id",
-        "invalid_attachment_effect_ids": "invalid_attachment_effect_id",
+        "name_ids": "name_id", "card_type_ids": "card_type_id", "stage_ids": "stage_id",
+        "rule_ids": "rule_id", "category_ids": "category_id", "type_ids": "type_id",
+        "weakness_type_ids": "weakness_type_id", "resistance_type_ids": "resistance_type_id",
+        "evolves_from_name_ids": "evolves_from_name_id",
     }
     scalar_float = [
-        "evolves_from_mask", "hp", "hp_normalized", "hp_mask", "pokemon_type_mask",
-        "provided_energy_mask", "weakness_value", "weakness_normalized", "weakness_mask",
-        "provided_energy_amount", "provided_energy_amount_mask",
-        "resistance_value", "resistance_normalized", "resistance_mask", "retreat", "retreat_normalized", "retreat_mask",
+        "hp_normalized", "hp_mask", "retreat_normalized", "retreat_mask", "evolves_from_mask",
     ]
     for output_name, field in scalar_long.items():
         batch[output_name] = torch.tensor([card[field] for card in cards], dtype=torch.long)
     for field in scalar_float:
         batch[field] = torch.tensor([card[field] for card in cards], dtype=torch.float32)
-    batch["rule_flags"] = torch.tensor([card["rule_flags"] for card in cards], dtype=torch.float32)
-    batch["provided_energy_counts"] = torch.tensor([card["provided_energy_counts"] for card in cards], dtype=torch.float32)
-    batch["provided_energy_allowed_type_mask"] = torch.tensor(
-        [card["provided_energy_allowed_type_mask"] for card in cards], dtype=torch.float32
-    )
-    batch["evolves_to_ids"] = torch.tensor(
-        [card["evolves_to_ids"] + [0] * (max_evolves - len(card["evolves_to_ids"])) for card in cards], dtype=torch.long,
+    batch["evolves_to_name_ids"] = torch.tensor(
+        [
+            card["evolves_to_name_ids"] + [0] * (max_evolves - len(card["evolves_to_name_ids"]))
+            for card in cards
+        ],
+        dtype=torch.long,
     )
     batch["evolves_to_mask"] = torch.tensor(
-        [[1.0] * len(card["evolves_to_ids"]) + [0.0] * (max_evolves - len(card["evolves_to_ids"])) for card in cards], dtype=torch.float32,
+        [
+            [1.0] * len(card["evolves_to_name_ids"])
+            + [0.0] * (max_evolves - len(card["evolves_to_name_ids"]))
+            for card in cards
+        ],
+        dtype=torch.float32,
     )
 
     detail_fields: dict[str, list[Any]] = {name: [] for name in [
-        "detail_indices", "detail_type_ids", "detail_subtype_ids", "detail_name_ids", "detail_identity_ids",
+        "detail_ids", "detail_type_ids", "detail_subtype_ids", "detail_name_ids",
         "detail_mask", "detail_text_ids", "detail_text_mask", "attack_energy_counts", "attack_energy_mask",
         "damage_raw", "damage_normalized", "damage_mode_ids", "damage_mask", "attack_ids",
     ]}
@@ -337,10 +289,10 @@ def collate_cards(items: list[dict[str, Any]]) -> dict[str, Any]:
     for item in items:
         rows = item["details"]
         padding = max_details - len(rows)
-        detail_fields["detail_indices"].append([row["detail_index"] for row in rows] + [-1] * padding)
+        detail_fields["detail_ids"].append([row["detail_id"] for row in rows] + [-1] * padding)
         for source, target in [
             ("detail_type_id", "detail_type_ids"), ("detail_subtype_id", "detail_subtype_ids"),
-            ("detail_name_id", "detail_name_ids"), ("detail_identity_id", "detail_identity_ids"),
+            ("detail_name_id", "detail_name_ids"),
             ("damage_mode_id", "damage_mode_ids"), ("attack_id", "attack_ids"),
         ]:
             detail_fields[target].append([row[source] for row in rows] + [0] * padding)
@@ -353,7 +305,10 @@ def collate_cards(items: list[dict[str, Any]]) -> dict[str, Any]:
         detail_fields["detail_text_ids"].append(text_rows + [[0] * max_text for _ in range(padding)])
         detail_fields["detail_text_mask"].append(text_masks + [[0.0] * max_text for _ in range(padding)])
         damage_raw_texts.append([row["damage_raw_text"] for row in rows] + [None] * padding)
-    long_fields = {"detail_indices", "detail_type_ids", "detail_subtype_ids", "detail_name_ids", "detail_identity_ids", "detail_text_ids", "damage_mode_ids", "attack_ids"}
+    long_fields = {
+        "detail_ids", "detail_type_ids", "detail_subtype_ids", "detail_name_ids", "detail_text_ids",
+        "damage_mode_ids", "attack_ids",
+    }
     for field, values in detail_fields.items():
         batch[field] = torch.tensor(values, dtype=torch.long if field in long_fields else torch.float32)
     batch["detail_mask"] = batch["detail_mask"].bool()

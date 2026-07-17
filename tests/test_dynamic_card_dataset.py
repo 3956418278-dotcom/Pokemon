@@ -16,36 +16,32 @@ from data.replay_feature_audit import build_report
 def _catalog_files(tmp_path: Path) -> tuple[Path, Path, Path]:
     records = [
         {
-            "card_id": "5",
+            "card_id": 5,
             "name": "Basic Psychic Energy",
             "card_type": "BASIC_ENERGY",
-            "provided_energy_types": ["P"],
-            "attack_ids": [],
-            "attack_energy_costs": [],
+            "type": "P",
+            "detail_ids": [],
         },
         {
-            "card_id": "10",
+            "card_id": 10,
             "name": "Flexible Energy",
             "card_type": "SPECIAL_ENERGY",
-            "provided_energy_types": ["A"],
-            "attack_ids": [],
-            "attack_energy_costs": [],
+            "type": None,
+            "detail_ids": [],
         },
         {
-            "card_id": "19",
+            "card_id": 19,
             "name": "Fixed Psychic Energy",
             "card_type": "SPECIAL_ENERGY",
-            "provided_energy_types": ["P"],
-            "attack_ids": [],
-            "attack_energy_costs": [],
+            "type": None,
+            "detail_ids": [],
         },
         {
-            "card_id": "21",
+            "card_id": 21,
             "name": "Two Attack Pokemon",
             "card_type": "POKEMON",
-            "provided_energy_types": [],
-            "attack_ids": [1, 2],
-            "attack_energy_costs": [{"C": 1}, {"C": 1, "P": 1}],
+            "type": "P",
+            "detail_ids": [0, 1, 2],
         },
     ]
     details = {
@@ -57,8 +53,8 @@ def _catalog_files(tmp_path: Path) -> tuple[Path, Path, Path]:
             {
                 "card_id": "21",
                 "details": [
-                    {"detail_index": 0, "detail_type": "attack", "attack_id": "1"},
-                    {"detail_index": 1, "detail_type": "attack", "attack_id": "2"},
+                    {"detail_index": 0, "detail_type": "attack", "attack_id": "1", "energy_counts": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]},
+                    {"detail_index": 1, "detail_type": "attack", "attack_id": "2", "energy_counts": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]},
                     {"detail_index": 2, "detail_type": "ability", "ability_index": 0},
                 ],
             }
@@ -148,7 +144,7 @@ def test_special_energy_resolution_is_conservative(tmp_path: Path) -> None:
     counts = [0] * 12
     counts[5] = 1
     assert catalog.energy_payment_is_resolved(_pokemon(serial=1, energy_counts=counts, energy_card_ids=[5]))
-    assert catalog.energy_payment_is_resolved(_pokemon(serial=2, energy_counts=counts, energy_card_ids=[19]))
+    assert not catalog.energy_payment_is_resolved(_pokemon(serial=2, energy_counts=counts, energy_card_ids=[19]))
     assert not catalog.energy_payment_is_resolved(_pokemon(serial=3, energy_counts=counts, energy_card_ids=[10]))
     rainbow = [0] * 12
     rainbow[10] = 1
@@ -191,20 +187,16 @@ def test_catalog_uses_physical_artifact_width_and_keeps_legacy_packed_indices_un
     records.extend(
         [
             {
-                "card_id": "22",
+                "card_id": 22,
                 "name": "Ability Card",
                 "card_type": "POKEMON",
-                "provided_energy_types": [],
-                "attack_ids": [],
-                "attack_energy_costs": [],
+                "detail_ids": [0, 1],
             },
             {
-                "card_id": "23",
+                "card_id": 23,
                 "name": "Effect Card",
                 "card_type": "ITEM",
-                "provided_energy_types": [],
-                "attack_ids": [],
-                "attack_energy_costs": [],
+                "detail_ids": [0, 1, 2],
             },
         ]
     )
@@ -254,8 +246,8 @@ def test_catalog_filters_null_attack_details_and_reports_alignment_anomaly(tmp_p
     card = next(row for row in details["cards"] if row["card_id"] == "21")
     card["details"] = [
         {"detail_index": 0, "detail_type": "attack", "attack_id": None, "attack_name": "[Ability] Fake"},
-        {"detail_index": 1, "detail_type": "attack", "attack_id": "1"},
-        {"detail_index": 2, "detail_type": "attack", "attack_id": "2"},
+        {"detail_index": 1, "detail_type": "attack", "attack_id": "1", "energy_counts": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]},
+        {"detail_index": 2, "detail_type": "attack", "attack_id": "2", "energy_counts": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]},
         {"detail_index": 3, "detail_type": "ability", "ability_index": 0},
     ]
     details_path.write_text(json.dumps(details), encoding="utf-8")
@@ -283,8 +275,8 @@ def test_collator_masks_only_null_attack_physical_slot(tmp_path: Path) -> None:
     card = next(row for row in details["cards"] if row["card_id"] == "21")
     card["details"] = [
         {"detail_index": 0, "detail_type": "attack", "attack_id": None, "attack_name": "[Ability] Fake"},
-        {"detail_index": 1, "detail_type": "attack", "attack_id": "1"},
-        {"detail_index": 2, "detail_type": "attack", "attack_id": "2"},
+        {"detail_index": 1, "detail_type": "attack", "attack_id": "1", "energy_counts": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]},
+        {"detail_index": 2, "detail_type": "attack", "attack_id": "2", "energy_counts": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]},
         {"detail_index": 3, "detail_type": "ability", "ability_index": 0},
     ]
     details_path.write_text(json.dumps(details), encoding="utf-8")
@@ -308,20 +300,20 @@ def test_collator_masks_only_null_attack_physical_slot(tmp_path: Path) -> None:
 
 def test_catalog_rejects_ambiguous_duplicate_attack_ids(tmp_path: Path) -> None:
     records_path, details_path, mapping_path = _catalog_files(tmp_path)
-    records = json.loads(records_path.read_text(encoding="utf-8"))
-    pokemon = next(row for row in records if row["card_id"] == "21")
-    pokemon["attack_ids"] = [1, 1]
-    records_path.write_text(json.dumps(records), encoding="utf-8")
+    details = json.loads(details_path.read_text(encoding="utf-8"))
+    pokemon = next(row for row in details["cards"] if row["card_id"] == "21")
+    pokemon["details"][1]["attack_id"] = 1
+    details_path.write_text(json.dumps(details), encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate attack_ids"):
         AttackCostCatalog.from_files(records_path, details_path, mapping_path)
 
 
 def test_missing_attack_cost_is_unresolved_and_reported_not_misaligned(tmp_path: Path) -> None:
     records_path, details_path, mapping_path = _catalog_files(tmp_path)
-    records = json.loads(records_path.read_text(encoding="utf-8"))
-    pokemon = next(row for row in records if row["card_id"] == "21")
-    pokemon["attack_energy_costs"] = [{"0": 1}]
-    records_path.write_text(json.dumps(records), encoding="utf-8")
+    details = json.loads(details_path.read_text(encoding="utf-8"))
+    pokemon = next(row for row in details["cards"] if row["card_id"] == "21")
+    pokemon["details"][1]["energy_counts"] = None
+    details_path.write_text(json.dumps(details), encoding="utf-8")
     catalog = AttackCostCatalog.from_files(records_path, details_path, mapping_path)
     assert [row.cost_known for row in catalog.attack_details(21)] == [True, False]
     assert any(row["kind"] == "attack_cost_missing" for row in catalog.static_catalog.alignment_anomalies)

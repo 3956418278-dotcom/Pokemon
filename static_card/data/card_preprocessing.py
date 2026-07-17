@@ -6,9 +6,10 @@ import importlib
 import json
 import re
 import sys
+import unicodedata
 import zipfile
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -16,24 +17,44 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE_DIR = ROOT / "static_card" / "artifacts" / "card_data"
+CORPUS_SCHEMA_VERSION = 6
 ENERGY_TYPES = ["C", "G", "R", "W", "L", "P", "F", "D", "M", "N", "Y", "A"]
 CG_ENERGY_TYPES = {0: "C", 1: "G", 2: "R", 3: "W", 4: "L", 5: "P", 6: "F", 7: "D", 8: "M", 9: "N", 10: "Y"}
 CG_CARD_TYPES = {0: "POKEMON", 1: "ITEM", 2: "TOOL", 3: "SUPPORTER", 4: "STADIUM", 5: "BASIC_ENERGY", 6: "SPECIAL_ENERGY"}
-NULL_TOKEN = "<NULL>"
-UNK_TOKEN = "<UNK>"
-MASK_TOKEN = "<MASK>"
 SOURCE_COLUMNS = [
     "Card ID", "Card Name", "Expansion", "Collection No.", "Stage (Pokémon)/Type (Energy and Trainer)",
     "Rule", "Category", "Previous stage", "HP", "Type", "Weakness", "Resistance (Type)", "Retreat",
     "Move Name", "Cost", "Damage", "Effect Explanation",
 ]
 CARD_LEVEL_COLUMNS = SOURCE_COLUMNS[:13]
+CARD_TYPE_STAGE_MAP: dict[str, tuple[str, str | None]] = {
+    "Basic Pokémon": ("POKEMON", "BASIC"),
+    "Stage 1 Pokémon": ("POKEMON", "STAGE1"),
+    "Stage 2 Pokémon": ("POKEMON", "STAGE2"),
+    "Item": ("ITEM", None),
+    "Pokémon Tool": ("TOOL", None),
+    "Supporter": ("SUPPORTER", None),
+    "Stadium": ("STADIUM", None),
+    "Basic Energy": ("BASIC_ENERGY", None),
+    "Special Energy": ("SPECIAL_ENERGY", None),
+}
+RULE_MAP: dict[str, str] = {
+    "Pokémon ex": "POKEMON_EX",
+    "Mega Pokémon ex": "MEGA_POKEMON_EX",
+    "ACE SPEC": "ACE_SPEC",
+}
+TYPE_MAP = {
+    **{f"{{{energy_type}}}": energy_type for energy_type in CG_ENERGY_TYPES.values() if energy_type != "N"},
+    "{N}": "DRAGON",
+    "竜": "DRAGON",
+}
 
 
 @dataclass
 class DetailRecord:
+    detail_id: int
     detail_index: int
-    card_id: str
+    card_id: int
     source_row: int
     source_line: int
     detail_type: str
@@ -53,48 +74,23 @@ class DetailRecord:
 
 @dataclass
 class CardRecord:
-    card_id: str
+    card_id: int
     name: str
-    expansion: str
-    collection_no: str
-    category: str
     card_type: str
-    subtype: str | None
-    card_tags: list[str]
-    pokemon_type: str | None
     stage: str | None
+    rule: str | None
+    category: str | None
+    type: str | None
     hp: int | None
-    hp_applicability: str
-    retreat_cost: int | None
     weakness_type: str | None
-    weakness_value: float | None
     resistance_type: str | None
-    resistance_value: float | None
+    retreat_cost: int | None
     evolves_from: str | None
     evolves_to: list[str]
-    rule_flags: list[str]
-    ability_texts: list[str]
-    attack_texts: list[str]
-    attack_names: list[str]
-    attack_damage: list[int | None]
-    attack_energy_costs: list[dict[str, int]]
-    trainer_type: str | None
-    provided_energy_types: list[str]
-    provided_energy_counts: list[int]
-    provided_energy_amount: int | None
-    provided_energy_allowed_types: list[str]
-    provided_energy_mode: str | None
-    attachment_restriction: str | None
-    invalid_attachment_effect: str | None
-    full_effect_text: str
-    attack_ids: list[int]
-    detail_start: int
-    detail_end: int
+    detail_ids: list[int]
+    expansion: str
+    collection_no: str
     source_fields: dict[str, str] = field(default_factory=dict)
-
-
-def stable_hash(text: str, modulo: int) -> int:
-    return int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16) % modulo
 
 
 def normalize_missing(value: Any) -> str:
@@ -105,7 +101,8 @@ def normalize_missing(value: Any) -> str:
 
 
 def normalized_text(value: Any) -> str:
-    return re.sub(r"\s+", " ", normalize_missing(value).replace("\xa0", " ")).strip()
+    text = unicodedata.normalize("NFC", normalize_missing(value)).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def parse_int(value: Any) -> int | None:
@@ -128,10 +125,6 @@ def parse_damage_fields(value: Any) -> tuple[int | None, str]:
     return base, "FIXED" if base is not None else "VARIABLE"
 
 
-def parse_damage(value: Any) -> int | None:
-    return parse_damage_fields(value)[0]
-
-
 def parse_energy_symbols(value: Any) -> list[str]:
     text = normalize_missing(value)
     symbols = [x.strip().upper() for x in re.findall(r"\{([^}]+)\}", text) if x.strip()]
@@ -147,10 +140,6 @@ def energy_counts(value: Any) -> list[int]:
     return [int(counts.get(name, 0)) for name in ENERGY_TYPES]
 
 
-def energy_cost_dict(value: Any) -> dict[str, int]:
-    return {name: count for name, count in zip(ENERGY_TYPES, energy_counts(value)) if count}
-
-
 def cg_energy_counts(values: list[Any]) -> list[int]:
     result = [0] * len(ENERGY_TYPES)
     for value in values or []:
@@ -161,66 +150,40 @@ def cg_energy_counts(values: list[Any]) -> list[int]:
     return result
 
 
-def split_flags(value: Any) -> list[str]:
-    text = normalize_missing(value)
-    return sorted({x.strip() for x in re.split(r"[,;/]+", text) if x.strip()}) if text else []
+def card_type_and_stage(kind: Any) -> tuple[str, str | None]:
+    normalized = normalized_text(kind)
+    try:
+        return CARD_TYPE_STAGE_MAP[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unknown E-column value: {normalized!r}") from exc
 
 
-def normalized_card_tags(value: Any) -> list[str]:
-    text = normalize_missing(value)
-    if not text:
-        return []
-    if text.startswith("Tera(") and text.endswith(")"):
-        return ["TERA", f"TERA_{text[5:-1].upper()}"]
-    if text.startswith("Trainer's Pokémon"):
-        owner = re.search(r"[（(]([^）)]+)[）)]", text)
-        owner_tag = re.sub(r"[^A-Z0-9]+", "_", owner.group(1).upper()).strip("_") if owner else "UNKNOWN"
-        return ["TRAINERS_POKEMON", f"OWNER_{owner_tag}"]
-    return [re.sub(r"[^A-Z0-9]+", "_", text.upper()).strip("_")]
+def normalized_rule(value: Any) -> str | None:
+    normalized = normalized_text(value)
+    if not normalized:
+        return None
+    try:
+        return RULE_MAP[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unknown F-column value: {normalized!r}") from exc
 
 
-def card_type_from_kind(kind: str) -> str:
-    lower = kind.lower()
-    if "basic energy" in lower:
-        return "BASIC_ENERGY"
-    if "special energy" in lower:
-        return "SPECIAL_ENERGY"
-    if "tool" in lower:
-        return "TOOL"
-    if "supporter" in lower:
-        return "SUPPORTER"
-    if "stadium" in lower:
-        return "STADIUM"
-    if "item" in lower:
-        return "ITEM"
-    if "pok" in lower:
-        return "POKEMON"
-    return kind.upper().replace(" ", "_") if kind else "UNKNOWN"
+def normalized_type(value: Any) -> str:
+    normalized = normalized_text(value)
+    try:
+        return TYPE_MAP[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unknown Type-column value: {normalized!r}") from exc
 
 
-def broad_category(card_type: str) -> str:
-    if card_type == "POKEMON":
-        return "POKEMON"
-    if card_type in {"ITEM", "TOOL", "SUPPORTER", "STADIUM"}:
-        return "TRAINER"
-    if card_type in {"BASIC_ENERGY", "SPECIAL_ENERGY"}:
-        return "ENERGY"
-    return "UNKNOWN"
-
-
-def stage_from_kind(kind: str) -> str | None:
-    lower = kind.lower()
-    if "basic" in lower and "energy" not in lower:
-        return "BASIC"
-    if "stage 1" in lower or "stage1" in lower:
-        return "STAGE1"
-    if "stage 2" in lower or "stage2" in lower:
-        return "STAGE2"
-    return None
-
-
-def trainer_type_from_card_type(card_type: str) -> str | None:
-    return card_type if card_type in {"ITEM", "TOOL", "SUPPORTER", "STADIUM"} else None
+def normalized_energy_symbol(value: Any) -> str | None:
+    normalized = normalized_text(value)
+    if not normalized:
+        return None
+    symbols = parse_energy_symbols(normalized)
+    if len(symbols) != 1 or symbols[0] not in ENERGY_TYPES:
+        raise ValueError(f"expected one energy type symbol, got {value!r}")
+    return symbols[0]
 
 
 def read_csv_from_zip(zip_path: Path, member: str) -> list[dict[str, str]]:
@@ -314,7 +277,10 @@ def _detail_subtype(row: dict[str, str], detail_type: str) -> str:
         return "FOSSIL_EFFECT"
     if tag == "Technical Machine":
         return "TECHNICAL_MACHINE_EFFECT"
-    return f"{card_type_from_kind(kind)}_EFFECT"
+    card_type, _stage = card_type_and_stage(kind)
+    if card_type == "SPECIAL_ENERGY":
+        return "SPECIAL_ENERGY_EFFECT"
+    return f"{card_type}_EFFECT"
 
 
 def _norm_identity(text: Any) -> str:
@@ -324,36 +290,33 @@ def _norm_identity(text: Any) -> str:
 def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dict[str, Any]]:
     rows, source, source_sha = load_csv_rows()
     cg_cards, cg_attacks = load_cg_data(required=True)
-    grouped: dict[str, list[tuple[int, dict[str, str]]]] = defaultdict(list)
+    grouped: dict[int, list[tuple[int, dict[str, str]]]] = defaultdict(list)
     for source_row, row in enumerate(rows):
-        grouped[normalize_missing(row["Card ID"])].append((source_row, row))
+        card_id = parse_int(row["Card ID"])
+        if card_id is None:
+            raise ValueError(f"source row {source_row} has no Card ID")
+        grouped[card_id].append((source_row, row))
     if len(grouped) != len(cg_cards):
         raise ValueError(f"CSV/CG card count mismatch: {len(grouped)} != {len(cg_cards)}")
 
-    cards: list[CardRecord] = []
     details: list[DetailRecord] = []
     offsets = [0]
-    corrections = []
-    evolves_to: dict[str, set[str]] = defaultdict(set)
-    for _, entries in grouped.items():
-        first = entries[0][1]
-        parent = normalize_missing(first["Previous stage"])
-        if parent:
-            evolves_to[parent].add(normalize_missing(first["Card Name"]))
+    corrections: list[dict[str, Any]] = []
+    pending_cards: list[dict[str, Any]] = []
+    fossil_targets_by_name: dict[str, set[str]] = defaultdict(set)
 
-    for card_id in sorted(grouped, key=int):
+    for card_id in sorted(grouped):
         entries = grouped[card_id]
         first = entries[0][1]
         for _, row in entries[1:]:
             for column in CARD_LEVEL_COLUMNS:
-                if normalized_text(row[column]) != normalized_text(first[column]):
+                if row[column] != first[column]:
                     raise ValueError(f"card {card_id} has inconsistent {column}")
-        cid = int(card_id)
-        cg_card = cg_cards.get(cid)
+        cg_card = cg_cards.get(card_id)
         if cg_card is None:
             raise ValueError(f"card {card_id} missing from CG")
-        kind = normalize_missing(first["Stage (Pokémon)/Type (Energy and Trainer)"])
-        card_type = card_type_from_kind(kind)
+        kind = normalized_text(first["Stage (Pokémon)/Type (Energy and Trainer)"])
+        card_type, stage = card_type_and_stage(kind)
         expected_cg_type = CG_CARD_TYPES[int(cg_card.cardType)]
         if card_type != expected_cg_type:
             raise ValueError(f"card {card_id} type mismatch: CSV={card_type} CG={expected_cg_type}")
@@ -366,8 +329,7 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
             raise ValueError(f"card {card_id} attack count mismatch: {len(attack_rows)} != {len(attack_ids)}")
         attack_binding = {source_row: aid for (source_row, _), aid in zip(attack_rows, attack_ids)}
 
-        attack_names, attack_texts, attack_damage, attack_costs = [], [], [], []
-        ability_texts = []
+        detail_start = len(details)
         for source_row, row in entries:
             detail_type = _detail_type(row)
             if detail_type is None:
@@ -392,7 +354,7 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
                 attack = cg_attacks.get(int(attack_id))
                 if attack is None:
                     raise ValueError(f"card {card_id} missing attack {attack_id}")
-                if cid != 979 and _norm_identity(move_name) != _norm_identity(attack.name):
+                if card_id != 979 and _norm_identity(move_name) != _norm_identity(attack.name):
                     raise ValueError(f"card {card_id} attack name mismatch: {move_name} != {attack.name}")
                 counts = cg_energy_counts(list(attack.energies or []))
                 csv_counts = energy_counts(row["Cost"])
@@ -400,25 +362,21 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
                     raise ValueError(f"card {card_id} attack {attack_id} cost mismatch: {csv_counts} != {counts}")
                 if damage_mode in {"FIXED", "NONE"} and (damage_base if damage_base is not None else 0) != int(attack.damage):
                     raise ValueError(f"card {card_id} attack {attack_id} damage mismatch: {damage_base} != {attack.damage}")
-                if cid in {480, 481}:
+                if card_id in {480, 481}:
                     text = normalize_missing(attack.text)
                     row_corrections.append("CG_ENGLISH_TEXT_REPLACEMENT")
-                if cid == 979:
+                if card_id == 979:
                     row_corrections.append("FIXED_ATTACK_ID_BINDING_979")
-                attack_names.append(move_name)
-                attack_texts.append(text)
-                attack_damage.append(damage_base)
-                attack_costs.append({name: count for name, count in zip(ENERGY_TYPES, counts) if count})
             elif detail_type == "ABILITY":
-                if cid == 481:
+                if card_id == 481:
                     matching = [skill for skill in (cg_card.skills or []) if _norm_identity(skill.name) == _norm_identity(detail_name)]
                     if len(matching) != 1:
                         raise ValueError(f"card {card_id} ability CG binding failed: {move_name}")
                     text = normalize_missing(matching[0].text)
                     row_corrections.append("CG_ENGLISH_TEXT_REPLACEMENT")
-                ability_texts.append(text)
             detail = DetailRecord(
-                detail_index=len(details), card_id=card_id, source_row=source_row, source_line=source_row + 2,
+                detail_id=len(details), detail_index=len(details), card_id=card_id,
+                source_row=source_row, source_line=source_row + 2,
                 detail_type=detail_type, detail_subtype=_detail_subtype(row, detail_type), move_name=move_name,
                 detail_name=detail_name, text=text, source_text=source_text, attack_id=attack_id, energy_counts=counts,
                 damage_raw=normalize_missing(row["Damage"]) or None, damage_base=damage_base,
@@ -429,80 +387,143 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
             if row_corrections:
                 corrections.append({"card_id": card_id, "source_line": source_row + 2, "corrections": row_corrections, "source_text_sha256": hashlib.sha256(source_text.encode()).hexdigest(), "final_text_sha256": hashlib.sha256(text.encode()).hexdigest()})
 
-        category_value = normalize_missing(first["Category"])
-        tags = normalized_card_tags(category_value)
-        rule_flags = []
-        for flag, enabled in (("POKEMON_EX", cg_card.ex), ("MEGA_POKEMON_EX", cg_card.megaEx), ("TERA", cg_card.tera), ("ACE_SPEC", cg_card.aceSpec)):
-            if enabled:
-                rule_flags.append(flag)
-        rule_flags = sorted(set(rule_flags))
-        source_rule = normalize_missing(first["Rule"])
-        expected_source_flag = {"Pokémon ex": "POKEMON_EX", "Mega Pokémon ex": "MEGA_POKEMON_EX", "ACE SPEC": "ACE_SPEC"}.get(source_rule)
-        if source_rule and expected_source_flag not in rule_flags:
-            raise ValueError(f"card {card_id} rule mismatch: {source_rule} vs {rule_flags}")
-        printed_provided = parse_energy_symbols(first["Type"]) if "ENERGY" in card_type else []
-        printed_provided_counts = Counter(printed_provided)
-        provided_energy_counts = [int(printed_provided_counts.get(energy, 0)) for energy in ENERGY_TYPES]
-        provided_energy_amount = len(printed_provided) if printed_provided else None
-        provided_energy_allowed_types = sorted(
-            set(printed_provided),
-            key=lambda value: ENERGY_TYPES.index(value) if value in ENERGY_TYPES else len(ENERGY_TYPES),
-        )
-        provided_energy_mode = "PRINTED_PROFILE" if printed_provided else None
-        attachment_restriction = None
-        invalid_attachment_effect = None
-        if cid == 15:
-            provided_energy_counts = [0] * len(ENERGY_TYPES)
-            provided_energy_amount = 2
-            provided_energy_allowed_types = ["P", "D"]
-            provided_energy_mode = "CHOOSE_ANY_COMBINATION"
-            attachment_restriction = "TEAM_ROCKET_POKEMON_ONLY"
-            invalid_attachment_effect = "DISCARD"
-        pokemon_type = CG_ENERGY_TYPES.get(int(cg_card.energyType)) if card_type == "POKEMON" else None
+        rule = normalized_rule(first["Rule"])
+        cg_rule_checks = {
+            "POKEMON_EX": bool(cg_card.ex),
+            "MEGA_POKEMON_EX": bool(cg_card.megaEx),
+            "ACE_SPEC": bool(cg_card.aceSpec),
+        }
+        if rule is not None and not cg_rule_checks[rule]:
+            raise ValueError(f"card {card_id} rule mismatch: CSV={rule} CG={cg_rule_checks}")
+        if rule is None and any(cg_rule_checks.values()):
+            raise ValueError(f"card {card_id} has CG rule flags but no CSV Rule: {cg_rule_checks}")
+
+        category = normalized_text(first["Category"]) or None
+        type_value = normalized_text(first["Type"])
+        if card_type == "POKEMON":
+            card_type_value = normalized_type(type_value)
+            expected_pokemon_type = CG_ENERGY_TYPES.get(int(cg_card.energyType))
+            if expected_pokemon_type == "N":
+                expected_pokemon_type = "DRAGON"
+            if card_type_value != expected_pokemon_type:
+                raise ValueError(
+                    f"card {card_id} Pokémon type mismatch: CSV={card_type_value} CG={expected_pokemon_type}"
+                )
+        elif card_type == "BASIC_ENERGY":
+            card_type_value = normalized_type(type_value)
+        else:
+            card_type_value = None
+
         hp = parse_int(first["HP"])
-        if hp is None and card_type in {"ITEM", "TOOL"} and int(cg_card.hp) > 0:
-            hp = int(cg_card.hp)
-        hp_applicability = "PLAYABLE_AS_POKEMON" if category_value == "Fossil" else ("POKEMON" if card_type == "POKEMON" else "NOT_APPLICABLE")
-        effects = [detail.text for detail in details[offsets[-1]:] if detail.text]
-        cards.append(CardRecord(
-            card_id=card_id, name=normalize_missing(first["Card Name"]), expansion=normalize_missing(first["Expansion"]),
-            collection_no=normalize_missing(first["Collection No."]), category=broad_category(card_type), card_type=card_type,
-            subtype=kind or None, card_tags=tags, pokemon_type=pokemon_type, stage=stage_from_kind(kind), hp=hp,
-            hp_applicability=hp_applicability, retreat_cost=parse_int(first["Retreat"]),
-            weakness_type=(parse_energy_symbols(first["Weakness"]) or [None])[0], weakness_value=2.0 if normalize_missing(first["Weakness"]) else None,
-            resistance_type=(parse_energy_symbols(first["Resistance (Type)"]) or [None])[0], resistance_value=-30.0 if normalize_missing(first["Resistance (Type)"]) else None,
-            evolves_from=normalize_missing(first["Previous stage"]) or None, evolves_to=sorted(evolves_to.get(normalize_missing(first["Card Name"]), set())),
-            rule_flags=rule_flags, ability_texts=ability_texts, attack_texts=attack_texts, attack_names=attack_names,
-            attack_damage=attack_damage, attack_energy_costs=attack_costs, trainer_type=trainer_type_from_card_type(card_type),
-            provided_energy_types=provided_energy_allowed_types,
-            provided_energy_counts=provided_energy_counts,
-            provided_energy_amount=provided_energy_amount,
-            provided_energy_allowed_types=provided_energy_allowed_types,
-            provided_energy_mode=provided_energy_mode,
-            attachment_restriction=attachment_restriction,
-            invalid_attachment_effect=invalid_attachment_effect,
-            full_effect_text="\n".join(effects), attack_ids=attack_ids,
-            detail_start=offsets[-1], detail_end=len(details),
-            source_fields={column: first[column] for column in CARD_LEVEL_COLUMNS},
-        ))
+        weakness_type = normalized_energy_symbol(first["Weakness"])
+        resistance_type = normalized_energy_symbol(first["Resistance (Type)"])
+        retreat_cost = (parse_int(first["Retreat"]) or 0) if card_type == "POKEMON" else None
+
+        previous_stage = normalized_text(first["Previous stage"])
+        evolves_from = previous_stage or None if card_type == "POKEMON" else None
+        if category == "Fossil":
+            match = re.fullmatch(r"Evolve to\s+(.+)", previous_stage, flags=re.IGNORECASE)
+            if match is None:
+                raise ValueError(f"fossil card {card_id} has invalid Previous stage: {previous_stage!r}")
+            fossil_targets_by_name[normalized_text(first["Card Name"])].add(normalized_text(match.group(1)))
+
+        detail_ids = list(range(detail_start, len(details)))
+        pending_cards.append({
+            "card_id": card_id,
+            "name": normalized_text(first["Card Name"]),
+            "card_type": card_type,
+            "stage": stage,
+            "rule": rule,
+            "category": category,
+            "type": card_type_value,
+            "hp": hp,
+            "weakness_type": weakness_type,
+            "resistance_type": resistance_type,
+            "retreat_cost": retreat_cost,
+            "evolves_from": evolves_from,
+            "detail_ids": detail_ids,
+            "expansion": normalized_text(first["Expansion"]),
+            "collection_no": normalized_text(first["Collection No."]),
+            "source_fields": {column: first[column] for column in CARD_LEVEL_COLUMNS},
+        })
         offsets.append(len(details))
+
+    reverse_evolutions: dict[str, set[str]] = defaultdict(set)
+    for card in pending_cards:
+        if card["card_type"] == "POKEMON" and card["evolves_from"]:
+            reverse_evolutions[card["evolves_from"]].add(card["name"])
+    for fossil_name, explicit_targets in fossil_targets_by_name.items():
+        reverse_targets = reverse_evolutions.get(fossil_name, set())
+        if explicit_targets != reverse_targets:
+            raise ValueError(
+                f"fossil evolution mismatch for {fossil_name}: explicit={sorted(explicit_targets)} "
+                f"reverse={sorted(reverse_targets)}"
+            )
+
+    cards = [
+        CardRecord(
+            **card,
+            evolves_to=sorted(reverse_evolutions.get(card["name"], set()) | fossil_targets_by_name.get(card["name"], set())),
+        )
+        for card in pending_cards
+    ]
+
+    for card in cards:
+        if card.card_type != "SPECIAL_ENERGY":
+            continue
+        if card.type is not None or not card.detail_ids:
+            raise ValueError(f"special energy card {card.card_id} has invalid type/detail routing")
+        if any(
+            details[detail_id].detail_type != "CARD_EFFECT"
+            or details[detail_id].detail_subtype != "SPECIAL_ENERGY_EFFECT"
+            for detail_id in card.detail_ids
+        ):
+            raise ValueError(f"special energy card {card.card_id} has invalid detail classification")
 
     type_counts = Counter(x.detail_type for x in details)
     expected = {"ATTACK": 1556, "ABILITY": 223, "CARD_EFFECT": 235}
     if len(rows) != 2022 or len(cards) != 1267 or len(details) != 2014 or dict(type_counts) != expected or len(offsets) != 1268:
         raise ValueError(f"canonical corpus invariant failed: rows={len(rows)} cards={len(cards)} details={len(details)} types={dict(type_counts)} offsets={len(offsets)}")
     manifest = {
-        "schema_version": 4, "source": source, "source_sha256": source_sha, "source_rows": len(rows),
+        "schema_version": CORPUS_SCHEMA_VERSION,
+        "corpus_schema_version": CORPUS_SCHEMA_VERSION,
+        "card_record_schema_version": CORPUS_SCHEMA_VERSION,
+        "source": source, "source_sha256": source_sha, "source_rows": len(rows),
         "card_count": len(cards), "detail_count": len(details), "detail_type_counts": dict(type_counts),
         "cg_cards_loaded": len(cg_cards), "cg_attacks_loaded": len(cg_attacks), "corrections": corrections,
+        "card_record_fields": [field.name for field in fields(CardRecord)],
+        "detail_record_fields": [field.name for field in fields(DetailRecord)],
+        "metadata_only_fields": ["card_id", "expansion", "collection_no", "source_fields"],
+        "type_values": sorted({
+            value
+            for card in cards
+            for value in (card.type, card.weakness_type, card.resistance_type)
+            if value is not None
+        }),
+        "special_energy_detail_contract": {
+            "card_type": "SPECIAL_ENERGY",
+            "type": None,
+            "detail_type": "CARD_EFFECT",
+            "detail_subtype": "SPECIAL_ENERGY_EFFECT",
+        },
         "source_column_contract": {
-            "Card ID": "card identity, ordering, mapping; metadata only", "Card Name": "card identity feature and metadata",
-            "Expansion": "metadata", "Collection No.": "metadata", "Stage (Pokémon)/Type (Energy and Trainer)": "category/stage/subtype",
-            "Rule": "rule flags", "Category": "card tags", "Previous stage": "evolves_from/evolves_to",
-            "HP": "raw/normalized/presence/applicability", "Type": "pokemon type or structured provided-energy profile",
-            "Weakness": "weakness type", "Resistance (Type)": "resistance type", "Retreat": "raw/normalized/presence",
-            "Move Name": "detail name feature, detail classification, CG alignment, and source metadata", "Cost": "12-dimensional energy counts",
-            "Damage": "raw/base/mode/presence", "Effect Explanation": "detail text",
+            "Card ID": "stable identity and replay mapping",
+            "Card Name": "full card name",
+            "Expansion": "metadata",
+            "Collection No.": "metadata",
+            "Stage (Pokémon)/Type (Energy and Trainer)": "card_type + stage",
+            "Rule": "single rule",
+            "Category": "complete category string",
+            "Previous stage": "evolves_from / evolves_to",
+            "HP": "raw card HP",
+            "Type": "shared type for Pokémon and Basic Energy; audit-only for Special Energy",
+            "Weakness": "weakness type only",
+            "Resistance (Type)": "resistance type only",
+            "Retreat": "Pokémon retreat cost",
+            "Move Name": "independent DetailRecord",
+            "Cost": "independent DetailRecord",
+            "Damage": "independent DetailRecord",
+            "Effect Explanation": "independent DetailRecord",
         },
     }
     return cards, details, offsets, manifest
@@ -515,9 +536,25 @@ def build_records() -> tuple[list[CardRecord], dict[str, Any]]:
 
 def summarize_records(records: list[CardRecord]) -> dict[str, Any]:
     count = len(records)
-    nullable = ["pokemon_type", "stage", "hp", "retreat_cost", "weakness_type", "resistance_type", "evolves_from"]
-    lengths = [len(" ".join([x.name, x.full_effect_text, *x.ability_texts, *x.attack_names, *x.attack_texts])) for x in records]
-    return {"card_count": count, "type_counts": dict(Counter(x.card_type for x in records)), "missing_field_ratio": {field: round(sum(getattr(x, field) is None for x in records) / count, 4) for field in nullable}, "text_length": {"min": min(lengths), "mean": round(mean(lengths), 2), "max": max(lengths)}}
+    nullable = [
+        "stage", "rule", "category", "type", "hp", "weakness_type", "resistance_type",
+        "retreat_cost", "evolves_from",
+    ]
+    name_lengths = [len(record.name) for record in records]
+    return {
+        "card_count": count,
+        "card_type_counts": dict(Counter(record.card_type for record in records)),
+        "type_value_counts": dict(Counter(record.type for record in records if record.type is not None)),
+        "missing_field_ratio": {
+            field_name: round(sum(getattr(record, field_name) is None for record in records) / count, 4)
+            for field_name in nullable
+        },
+        "name_length": {
+            "min": min(name_lengths),
+            "mean": round(mean(name_lengths), 2),
+            "max": max(name_lengths),
+        },
+    }
 
 
 def write_card_cache(cache_dir: Path = DEFAULT_CACHE_DIR) -> dict[str, Any]:
@@ -537,13 +574,30 @@ def write_card_cache(cache_dir: Path = DEFAULT_CACHE_DIR) -> dict[str, Any]:
 
 def load_or_create_corpus(cache_dir: Path = DEFAULT_CACHE_DIR, rebuild: bool = False):
     required = [cache_dir / x for x in ("cards.json", "details.json", "detail_offsets.json", "card_id_to_index.json", "preprocess_manifest.json")]
+    if not rebuild and all(x.exists() for x in required):
+        try:
+            cached_manifest = json.loads(required[4].read_text(encoding="utf-8"))
+            rebuild = cached_manifest.get("schema_version") != CORPUS_SCHEMA_VERSION
+        except (OSError, ValueError, TypeError):
+            rebuild = True
     if rebuild or not all(x.exists() for x in required):
         write_card_cache(cache_dir)
-    return (
-        json.loads(required[0].read_text(encoding="utf-8")), json.loads(required[1].read_text(encoding="utf-8")),
-        json.loads(required[2].read_text(encoding="utf-8")), json.loads(required[3].read_text(encoding="utf-8")),
-        json.loads(required[4].read_text(encoding="utf-8")),
-    )
+    cards = json.loads(required[0].read_text(encoding="utf-8"))
+    details = json.loads(required[1].read_text(encoding="utf-8"))
+    offsets = json.loads(required[2].read_text(encoding="utf-8"))
+    mapping = json.loads(required[3].read_text(encoding="utf-8"))
+    manifest = json.loads(required[4].read_text(encoding="utf-8"))
+    if len(offsets) != len(cards) + 1 or offsets[-1] != len(details):
+        raise ValueError("card cache has invalid detail offsets")
+    for index, card in enumerate(cards):
+        expected_ids = list(range(offsets[index], offsets[index + 1]))
+        if card.get("detail_ids") != expected_ids:
+            raise ValueError(f"card {card.get('card_id')} detail_ids do not match detail_offsets")
+        if any(details[detail_id].get("detail_id") != detail_id for detail_id in expected_ids):
+            raise ValueError(f"card {card.get('card_id')} points to an invalid detail_id")
+        if any(details[detail_id].get("card_id") != card.get("card_id") for detail_id in expected_ids):
+            raise ValueError(f"card {card.get('card_id')} detail_ids point to another card")
+    return cards, details, offsets, mapping, manifest
 
 
 def load_or_create_records(cache_dir: Path = DEFAULT_CACHE_DIR, rebuild: bool = False):

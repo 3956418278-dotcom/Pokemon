@@ -14,27 +14,6 @@ if TYPE_CHECKING:
     from .replay_dataset import ReplayDecisionSample
 
 
-AMBIGUOUS_ENERGY_PROVIDERS = {
-    "A",
-    "ANY",
-    "RAINBOW",
-    "TEAM ROCKET",
-    "TEAM_ROCKET",
-}
-FIXED_ENERGY_PROVIDERS = {
-    "C",
-    "G",
-    "R",
-    "W",
-    "L",
-    "P",
-    "F",
-    "D",
-    "M",
-    "N",
-    "Y",
-}
-
 DETAIL_TYPE_ORDER = ("attack", "ability", "special_effect")
 DETAIL_SLOT_RULE = "export_batch_group_padded_attack_ability_special_effect"
 SPECIAL_ENERGY_RESOLUTION_REASONS = {
@@ -48,7 +27,6 @@ ENERGY_TYPE_INDEX = {
         symbol: index
         for index, symbol in enumerate(("C", "G", "R", "W", "L", "P", "F", "D", "M", "N", "Y", "A"))
     },
-    "TEAM ROCKET": 11,
 }
 
 
@@ -248,23 +226,29 @@ class StaticCardCatalog:
         alignment_anomalies: list[dict[str, Any]] = []
         invalid_detail_slots_by_card_id: dict[int, set[int]] = {}
         for card_id, details in details_by_card_id.items():
-            record = records.get(card_id, {})
             try:
-                attack_ids = [int(value) for value in record.get("attack_ids", [])]
+                attack_ids = [
+                    int(detail["attack_id"])
+                    for detail in details
+                    if str(detail.get("detail_type", "")).lower() == "attack"
+                    and detail.get("attack_id") is not None
+                ]
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"card {card_id} has a non-integer attack_id in card_records") from exc
+                raise ValueError(f"card {card_id} has a non-integer attack_id in detail metadata") from exc
             if len(attack_ids) != len(set(attack_ids)):
-                raise ValueError(f"card {card_id} has duplicate attack_ids in card_records")
-            attack_costs = list(record.get("attack_energy_costs", []))
-            if len(attack_ids) != len(attack_costs):
-                alignment_anomalies.append(
-                    {
-                        "kind": "record_attack_cost_count_mismatch",
-                        "card_id": card_id,
-                        "attack_id_count": len(attack_ids),
-                        "attack_cost_count": len(attack_costs),
+                raise ValueError(f"card {card_id} has duplicate attack_ids in detail metadata")
+            attack_costs: list[Any] = []
+            for detail in details:
+                if str(detail.get("detail_type", "")).lower() != "attack" or detail.get("attack_id") is None:
+                    continue
+                source = detail.get("energy_counts")
+                if isinstance(source, (list, tuple)):
+                    source = {
+                        energy_type: int(count)
+                        for energy_type, count in zip(ENERGY_TYPE_NAMES, source)
+                        if int(count)
                     }
-                )
+                attack_costs.append(source)
             rows: list[AttackDetail] = []
             seen_metadata_attack_ids: set[int] = set()
             attack_ordinal = 0
@@ -375,11 +359,9 @@ class StaticCardCatalog:
         for card_id, record in records.items():
             if str(record.get("card_type", "")).upper() != "SPECIAL_ENERGY":
                 continue
-            providers = {str(value).strip().upper() for value in record.get("provided_energy_types", [])}
-            if not providers or providers & AMBIGUOUS_ENERGY_PROVIDERS:
-                ambiguous_special_energy_ids.add(card_id)
-            elif not providers <= FIXED_ENERGY_PROVIDERS:
-                unknown_special_energy_ids.add(card_id)
+            # Special Energy has no static provider type; its printed Type
+            # column and effect remain in source metadata / DetailRecord.
+            ambiguous_special_energy_ids.add(card_id)
 
         return cls(
             card_id_to_index=card_id_to_index,
