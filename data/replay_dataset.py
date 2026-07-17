@@ -82,6 +82,18 @@ class ReplayDecisionSample:
         return self.step_index
 
     @property
+    def archive_member(self) -> str | None:
+        return self.source_archive_member
+
+    @property
+    def jsonl_record_line(self) -> int | None:
+        return self.source_record_line
+
+    @property
+    def raw_content_hash(self) -> str | None:
+        return self.source_content_hash
+
+    @property
     def decision_key(self) -> DecisionKey:
         if self.action_step_index is None:
             raise ValueError("a finalized decision must have an action_step_index")
@@ -97,6 +109,7 @@ class ReplayDecisionSample:
 @dataclass
 class ReplayDatasetSummary:
     replay_count: int = 0
+    duplicate_replay_content_count: int = 0
     sample_count: int = 0
     skipped_no_select: int = 0
     parser_errors: list[dict[str, Any]] = field(default_factory=list)
@@ -109,6 +122,10 @@ class ReplayDatasetSummary:
     unpaired_pending: int = 0
     illegal_action_indices: int = 0
     unexpected_unpaired_actions: int = 0
+    agent_perspective_match_count: int = 0
+    agent_perspective_mismatch_count: int = 0
+    agent_perspective_unknown_count: int = 0
+    turn_owner_conflict_count: int = 0
     action_semantics_counts: Counter[str] = field(default_factory=Counter)
 
 
@@ -170,28 +187,79 @@ def replay_content_hash(replay: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _normalized_source_path(path: Path) -> str:
-    return path.resolve().as_posix()
-
-
 def stable_replay_key(
     replay: dict[str, Any],
-    replay_path: Path,
+    replay_path: Path | None = None,
     record_line: int | None = None,
     archive_member: str | None = None,
 ) -> str:
+    """Return Replay identity independent of its storage location.
+
+    ``replay_path``, ``record_line``, and ``archive_member`` remain accepted for
+    call-site compatibility, but are provenance only and never affect identity.
+    """
+
     info = replay.get("info")
     episode_id = info.get("EpisodeId") if isinstance(info, dict) else None
     if episode_id is not None:
         return f"episode:{episode_id}"
     if replay.get("id") is not None:
         return f"replay:{replay['id']}"
-    if archive_member is not None:
-        return f"archive:{archive_member}"
-    path = _normalized_source_path(replay_path)
-    if record_line is not None:
-        return f"jsonl:{path}#L{record_line}"
-    return f"path:{path}"
+    return f"content:{replay_content_hash(replay)}"
+
+
+@dataclass(frozen=True)
+class TurnOwnerResolution:
+    owner: int | None
+    state: FieldState
+    source: str | None
+    conflict: bool = False
+    explicit_fields: tuple[tuple[str, int], ...] = ()
+
+
+def resolve_turn_owner(current: Any) -> TurnOwnerResolution:
+    """Resolve absolute turn owner from the formal turn contract.
+
+    Explicit compatibility fields may confirm the formula, but cannot override
+    it. Setup and unknown-first-player states intentionally remain UNKNOWN.
+    """
+
+    if not isinstance(current, dict):
+        return TurnOwnerResolution(None, FieldState.UNKNOWN, None)
+    turn = _int(current.get("turn"), None)
+    first_player = _int(current.get("firstPlayer"), None)
+    if turn is None or turn < 1 or first_player not in (0, 1):
+        return TurnOwnerResolution(None, FieldState.UNKNOWN, None)
+    inferred = int(first_player) if turn % 2 == 1 else 1 - int(first_player)
+    explicit = tuple(
+        (field_name, int(value))
+        for field_name in ("turnOwner", "turnPlayer", "currentPlayerIndex")
+        if (value := _int(current.get(field_name), None)) in (0, 1)
+    )
+    if explicit and any(value != inferred for _, value in explicit):
+        return TurnOwnerResolution(
+            inferred,
+            FieldState.UNKNOWN,
+            "CONFLICTING_EXPLICIT_OWNER",
+            conflict=True,
+            explicit_fields=explicit,
+        )
+    return TurnOwnerResolution(
+        inferred,
+        FieldState.PRESENT,
+        "EXPLICIT_ENGINE_FIELD" if explicit else "INFERRED_TURN_FORMULA",
+        explicit_fields=explicit,
+    )
+
+
+def agent_perspective_state(observation: dict[str, Any], agent_index: int) -> tuple[str, int | None]:
+    current = observation.get("current")
+    if not isinstance(current, dict):
+        return "UNKNOWN", None
+    your_index = _int(current.get("yourIndex"), None)
+    if your_index not in (0, 1):
+        return "UNKNOWN", None
+    return ("MATCH" if your_index == agent_index else "MISMATCH"), int(your_index)
 
 
 @dataclass
@@ -247,6 +315,7 @@ class ReplayDecisionDataset:
         self.controlled_agents = controlled_agents
         self.samples: list[ReplayDecisionSample] = []
         self.summary = ReplayDatasetSummary()
+        self._seen_no_id_content_hashes: set[str] = set()
         self._load(max_samples=max_samples)
 
     @classmethod
@@ -351,7 +420,6 @@ class ReplayDecisionDataset:
         source_record_line: int | None = None,
         source_archive_member: str | None = None,
         source_content_hash: str | None = None,
-        replay_key_override: str | None = None,
     ) -> None:
         if not isinstance(replay, dict) or not isinstance(replay.get("steps"), list):
             self._record_error(
@@ -360,15 +428,21 @@ class ReplayDecisionDataset:
                 stage="replay_structure",
             )
             return
+        info = replay.get("info")
+        episode_id = info.get("EpisodeId") if isinstance(info, dict) else None
+        replay_id = replay.get("id")
+        canonical_hash = replay_content_hash(replay)
+        if episode_id is None and replay_id is None:
+            if canonical_hash in self._seen_no_id_content_hashes:
+                self.summary.duplicate_replay_content_count += 1
+                return
+            self._seen_no_id_content_hashes.add(canonical_hash)
         self.summary.replay_count += 1
         memories: dict[int, GameMemoryState] = {}
         pending: dict[int, _PendingDecision] = {}
         last_fingerprint: dict[int, str] = {}
-        replay_id = replay.get("id")
-        info = replay.get("info")
-        episode_id = info.get("EpisodeId") if isinstance(info, dict) else None
         source_date = replay_source_date(replay_path)
-        replay_key = replay_key_override or stable_replay_key(
+        replay_key = stable_replay_key(
             replay, replay_path, source_record_line, source_archive_member
         )
         if not replay_key:
@@ -512,6 +586,41 @@ class ReplayDecisionDataset:
                         agent=agent_index,
                     )
                     continue
+                perspective, your_index = agent_perspective_state(observation, agent_index)
+                if perspective == "MATCH":
+                    self.summary.agent_perspective_match_count += 1
+                elif perspective == "MISMATCH":
+                    self.summary.agent_perspective_mismatch_count += 1
+                    self._record_error(
+                        replay_path,
+                        (
+                            "AgentPerspectiveMismatch: "
+                            f"agent_index={agent_index}, yourIndex={your_index}"
+                        ),
+                        stage="agent_perspective",
+                        step=step_index,
+                        agent=agent_index,
+                        line=source_record_line,
+                    )
+                    continue
+                else:
+                    self.summary.agent_perspective_unknown_count += 1
+                owner_resolution = resolve_turn_owner(observation.get("current"))
+                if owner_resolution.conflict:
+                    self.summary.turn_owner_conflict_count += 1
+                    self._record_error(
+                        replay_path,
+                        (
+                            "TurnOwnerConflict: "
+                            f"formula_owner={owner_resolution.owner}, "
+                            f"explicit_fields={dict(owner_resolution.explicit_fields)}"
+                        ),
+                        stage="turn_owner_conflict",
+                        step=step_index,
+                        agent=agent_index,
+                        line=source_record_line,
+                    )
+                    continue
                 fingerprint = observation_fingerprint(observation)
                 if last_fingerprint.get(agent_index) == fingerprint:
                     self.summary.duplicate_old_observations += 1
@@ -559,6 +668,10 @@ class ReplayDecisionDataset:
                     "episode_id": sample.episode_id,
                     "episode_key": sample.episode_key,
                     "source_path": sample.source_path,
+                    "source_kind": sample.source_kind,
+                    "archive_member": sample.archive_member,
+                    "jsonl_record_line": sample.jsonl_record_line,
+                    "raw_content_hash": sample.raw_content_hash,
                     "source_date": sample.source_date,
                     "step_index": sample.step_index,
                     "decision_step_index": sample.decision_step_index,
@@ -595,6 +708,10 @@ def collate_replay_decisions(samples: list[ReplayDecisionSample]) -> dict[str, A
                 "episode_id": sample.episode_id,
                 "episode_key": sample.episode_key,
                 "source_path": sample.source_path,
+                "source_kind": sample.source_kind,
+                "archive_member": sample.archive_member,
+                "jsonl_record_line": sample.jsonl_record_line,
+                "raw_content_hash": sample.raw_content_hash,
                 "source_date": sample.source_date,
                 "step_index": sample.step_index,
                 "decision_step_index": sample.decision_step_index,
@@ -642,11 +759,11 @@ def replay_decision_reference_dict(
         "decision_key": asdict(sample.decision_key),
         "source": {
             "source_kind": sample.source_kind,
-            "replay_path": sample.source_path,
+            "source_path": sample.source_path,
             "archive_member": sample.source_archive_member,
-            "replay_record_line": sample.source_record_line,
+            "jsonl_record_line": sample.source_record_line,
             "replay_id": sample.replay_id,
-            "content_hash": sample.source_content_hash,
+            "raw_content_hash": sample.source_content_hash,
         },
         "observation_fingerprint": sample.observation_fingerprint,
         "select_type": sample.select_type,
@@ -751,31 +868,14 @@ def build_replay_decision_contract(
 
     first_state = state("firstPlayer")
     first_player = snapshot.first_player
-    starting = first_player == sample.agent_index if first_state is FieldState.PRESENT else False
-    explicit_owner = None
-    explicit_source = None
-    for owner_field in ("turnOwner", "turnPlayer", "currentPlayerIndex"):
-        if owner_field in current and current[owner_field] is not None:
-            parsed_owner = _int(current[owner_field], None)
-            if parsed_owner in (0, 1):
-                explicit_owner = int(parsed_owner)
-                explicit_source = "EXPLICIT_ENGINE_FIELD"
-                break
-    turn_owner = explicit_owner
-    turn_owner_state = FieldState.PRESENT if explicit_owner is not None else FieldState.UNKNOWN
-    turn_owner_source = explicit_source
-    if (
-        turn_owner is None
-        and first_state is FieldState.PRESENT
-        and first_player in (0, 1)
-        and state("turn") is FieldState.PRESENT
-        and snapshot.turn >= 1
-        and len(players) == 2
-    ):
-        turn_owner = first_player if snapshot.turn % 2 == 1 else 1 - first_player
-        turn_owner_state = FieldState.PRESENT
-        turn_owner_source = "INFERRED_AUDITED_TURN_RULE"
-    is_owner = turn_owner == sample.agent_index if turn_owner is not None else False
+    starting = first_player == your_index if first_state is FieldState.PRESENT else False
+    owner_resolution = resolve_turn_owner(current)
+    if owner_resolution.conflict:
+        raise ValueError("turn owner conflict cannot produce a training contract")
+    turn_owner = owner_resolution.owner
+    turn_owner_state = owner_resolution.state
+    turn_owner_source = owner_resolution.source
+    is_owner = turn_owner == your_index if turn_owner is not None else False
     match = MatchContextRecord(
         turn=_optional(snapshot.turn, state("turn")),
         turn_action_count=_optional(snapshot.turn_action_count, state("turnActionCount")),
@@ -942,11 +1042,11 @@ def rebuild_replay_decision_from_reference(
     if reference.get("decision_schema_version") != DECISION_SCHEMA_VERSION:
         raise ValueError("decision contract schema version mismatch")
     source = reference.get("source") or {}
-    raw_path = source_path or source.get("replay_path")
+    raw_path = source_path or source.get("source_path") or source.get("replay_path")
     if not raw_path:
         raise ValueError("decision reference has no replay source path")
     resolved_path = Path(raw_path)
-    expected_line = source.get("replay_record_line")
+    expected_line = source.get("jsonl_record_line", source.get("replay_record_line"))
     archive_member = source.get("archive_member")
     payload = None
     raw_hash = None
@@ -966,7 +1066,8 @@ def rebuild_replay_decision_from_reference(
     if payload is None:
         raise ValueError("referenced replay record was not found")
     actual_hash = raw_hash or replay_content_hash(payload)
-    if actual_hash != source.get("content_hash"):
+    expected_hash = source.get("raw_content_hash", source.get("content_hash"))
+    if actual_hash != expected_hash:
         raise ValueError("replay source content hash mismatch")
     dataset = ReplayDecisionDataset([])
     dataset._append_replay(
@@ -976,7 +1077,6 @@ def rebuild_replay_decision_from_reference(
         source_record_line=expected_line,
         source_archive_member=archive_member,
         source_content_hash=actual_hash,
-        replay_key_override=(reference.get("decision_key") or {}).get("replay_key"),
     )
     expected_key = reference.get("decision_key")
     for sample in dataset.samples:
@@ -995,10 +1095,19 @@ def iter_replay_decision_samples(
 ) -> Iterator[ReplayDecisionSample]:
     """Stream samples while retaining only one replay payload and its decisions."""
     emitted = 0
+    seen_no_id_content_hashes: set[str] = set()
     for replay_path in iter_replay_paths([Path(path) for path in paths]):
         try:
             payloads = _iter_replay_payloads(replay_path)
             for replay, line_number, content_hash in payloads:
+                info = replay.get("info") if isinstance(replay, dict) else None
+                episode_id = info.get("EpisodeId") if isinstance(info, dict) else None
+                replay_id = replay.get("id") if isinstance(replay, dict) else None
+                canonical_hash = replay_content_hash(replay)
+                if episode_id is None and replay_id is None:
+                    if canonical_hash in seen_no_id_content_hashes:
+                        continue
+                    seen_no_id_content_hashes.add(canonical_hash)
                 remaining = None if max_samples is None else max_samples - emitted
                 if remaining is not None and remaining <= 0:
                     return
@@ -1056,11 +1165,13 @@ def export_replay_decisions(
         "output_serialization_error_count": 0, "max_card_instances": 0, "max_legal_options": 0,
         "duplicate_old_observation": 0, "deck_configuration_action": 0,
         "unpaired_pending": 0, "illegal_action_index": 0,
-        "unexpected_unpaired_action": 0, "action_semantics": Counter(),
+        "unexpected_unpaired_action": 0, "duplicate_replay_content_count": 0,
+        "action_semantics": Counter(),
     }
     step_counts: list[int] = []
     decision_counts: list[int] = []
     errors: list[dict[str, Any]] = []
+    seen_no_id_content_hashes: set[str] = set()
     if error_path.exists():
         for line in error_path.read_text(encoding="utf-8").splitlines():
             if line.strip():
@@ -1078,6 +1189,15 @@ def export_replay_decisions(
                     steps = replay.get("steps") if isinstance(replay, dict) else None
                     if not isinstance(steps, list):
                         raise ValueError("replay must contain a steps list")
+                    info = replay.get("info") if isinstance(replay, dict) else None
+                    episode_id = info.get("EpisodeId") if isinstance(info, dict) else None
+                    replay_id = replay.get("id") if isinstance(replay, dict) else None
+                    canonical_hash = replay_content_hash(replay)
+                    if episode_id is None and replay_id is None:
+                        if canonical_hash in seen_no_id_content_hashes:
+                            summary["duplicate_replay_content_count"] += 1
+                            continue
+                        seen_no_id_content_hashes.add(canonical_hash)
                     step_counts.append(len(steps))
                     dataset = ReplayDecisionDataset(
                         [], controlled_agents=controlled_agents,

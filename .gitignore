@@ -16,6 +16,8 @@ __pycache__/
 # Generated training artifacts and local outputs
 artifacts/
 outputs/
+data_from_submission/replay_audit/
+data_from_submission/replay_dataset/
 checkpoints/
 logs/
 runs/

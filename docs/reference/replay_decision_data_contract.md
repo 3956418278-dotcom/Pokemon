@@ -17,9 +17,15 @@ replay_key + episode_id? + decision_step_index + action_step_index + player_inde
 ```
 
 `replay_key` is non-empty and is selected in this order: `EpisodeId`, replay
-`id`, ZIP member/JSONL record identity, normalized source path. `episode_id`
-remains nullable metadata. A JSONL line is part of source identity, so two
-records without Episode IDs cannot collide.
+`id`, canonical Replay content hash. The fallback hash is SHA-256 over the
+single Replay JSON object serialized with sorted keys and compact separators.
+It is therefore unchanged when the same Replay moves to another path, JSONL
+line, archive, or ZIP member. `episode_id` remains nullable metadata.
+
+`source_path`, `source_kind`, `archive_member`, `jsonl_record_line`, and the raw
+source hash are provenance and integrity fields only; none participates in
+Replay identity. Identical ID-less Replay objects share one `content:<sha256>`
+key, are reported as duplicate content, and enter the formal dataset once.
 
 Only actual `select` decision points enter behavior cloning. The former
 `include_no_select` option was removed because it never produced a defined
@@ -179,15 +185,44 @@ Unresolved equivalence, variable counts, or ordered sequences retain policy
 loss. Masking is allowed only for one engine option, one count value, or a
 fully-resolved action space with one feasible semantic result.
 
-## Turn ownership
+## Turn ownership and observation perspective
 
-Turn owner uses an explicit engine field when present. Otherwise, for a
-two-player non-setup state with valid `firstPlayer` and `turn`, the engine rule
-`((turn + 1) ^ firstPlayer) & 1` infers the owner and records
-`INFERRED_AUDITED_TURN_RULE`. Setup, missing, or conflicting cases remain
-`UNKNOWN`; select presence alone is never treated as ownership because forced
-effects may ask the non-turn player to act. The audit reports explicit,
-deterministically inferred, ambiguous, and conflicting counts.
+The three absolute indices have separate meanings:
+
+```text
+turn_owner = player whose normal turn is active
+current.yourIndex = player perspective used by current/select
+agent_index = outer Replay agent slot
+```
+
+For `turn >= 1` and `firstPlayer in {0, 1}`, absolute owner is
+`firstPlayer` on odd turns and `1 - firstPlayer` on even turns. Setup and an
+unknown first player remain `UNKNOWN`. Compatibility fields `turnOwner`,
+`turnPlayer`, and `currentPlayerIndex` may confirm this formula but never
+override it. A disagreement is a `turn_owner_conflict`, retains source/step
+provenance, and cannot produce a training sample.
+
+Both `is_turn_owner` and `turn_owner_relative` are relative to
+`current.yourIndex`; relative value `0` means self and `1` means opponent.
+Every observation audits `agent_index == current.yourIndex`. A mismatch is
+recorded with Replay/member, step, and both indices and is excluded before any
+relative-player feature or training label is produced.
+
+## Full Replay audit
+
+The single audit entry point is:
+
+```bash
+python scripts/audit_replay_decision_contract.py \
+  outputs/replay_extract/replays/replays.zip \
+  --output-dir outputs/replay_decision_contract_audit_v2
+```
+
+It writes only `audit.json`, `action_semantics.csv`,
+`equivalence_resolution.csv`, `policy_mask_reasons.csv`,
+`turn_owner_audit.csv`, and `errors.jsonl`. The command exits nonzero on an
+illegal action index, DecisionKey collision, agent-perspective mismatch, turn
+owner conflict, or policy/equivalence masking invariant violation.
 
 ## Deferred training systems
 

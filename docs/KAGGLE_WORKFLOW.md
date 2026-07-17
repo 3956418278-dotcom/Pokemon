@@ -30,6 +30,25 @@ python scripts/import_online_replay_decisions.py \
 
 该入口只导出真实 `select` 决策点（无效的 `include_no_select` 接口已删除），逐 replay 写出紧凑的 `decisions/decision_references.jsonl.gz` 和 `reports/replay_feature_audit.json`。完整 observation、日志、卡牌实例和 Memory 不重复写入；训练时按含 `replay_key` 的 decision key 回读原始 Replay，并校验 source content hash、observation fingerprint、parser/schema version 后重建八类输入，任一不一致都会明确失败。
 
+无 EpisodeId 和 replay id 时，`replay_key` 使用单个 Replay JSON 对象的
+canonical SHA-256，不使用路径、JSONL 行号或 ZIP member。定位字段仍单独保留，
+同内容的无 ID Replay 会被去重。
+
+完整决策合同审计统一运行：
+
+```bash
+python scripts/audit_replay_decision_contract.py \
+  outputs/replay_extract/replays/replays.zip \
+  --output-dir outputs/replay_decision_contract_audit_v2
+```
+
+归档应包含 7,500 场；审计目录只包含 `audit.json`、
+`action_semantics.csv`、`equivalence_resolution.csv`、
+`policy_mask_reasons.csv`、`turn_owner_audit.csv` 和 `errors.jsonl`。
+`agent_index != current.yourIndex`、显式 turn owner 与奇偶回合公式冲突、非法
+action index、DecisionKey 碰撞或 masking invariant 失败都会令命令非零退出，
+对应样本不会生成训练标签。
+
 热门牌组的完整 variant 使用 Card ID multiset，因此洗牌顺序不产生新 variant；Pokémon+Energy archetype 分组仍是独立逻辑。主流程依赖 `EN_Card_Data.csv` 的 Card Type，找不到时会列出搜索路径并停止，不会生成空 signature 结果。
 
 归一化统计必须明确训练时间窗，例如：

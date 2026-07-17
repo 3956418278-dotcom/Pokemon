@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import importlib.util
 import gzip
+import hashlib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -30,7 +32,7 @@ write_daily_outputs = _KERNEL.write_daily_outputs
 build_popular_decks = _KERNEL.build_popular_decks
 
 
-REPLAY_PATH = Path("data_from_submission/replays/episode-84817357-replay.json")
+REPLAY_PATH = Path("tests/fixtures/replay/episode-84817357-replay.json")
 
 
 def test_replay_decision_dataset_from_real_replay() -> None:
@@ -140,7 +142,7 @@ def test_replay_provenance_is_preserved_in_index_and_collate(tmp_path: Path) -> 
     assert metadata["episode_key"] == "episode:85109456"
 
 
-def test_episode_key_falls_back_to_replay_then_source_path(tmp_path: Path) -> None:
+def test_replay_key_falls_back_to_replay_then_canonical_content(tmp_path: Path) -> None:
     daily = tmp_path / "pokemon-tcg-ai-battle-episodes-2026-07-10"
     daily.mkdir()
     replay_id_path = daily / "with-replay-id.json"
@@ -156,7 +158,10 @@ def test_episode_key_falls_back_to_replay_then_source_path(tmp_path: Path) -> No
     dataset = ReplayDecisionDataset.from_paths([replay_id_path, path_only_path])
     keys = {sample.episode_key for sample in dataset.samples}
     assert "replay:fallback-replay" in keys
-    assert f"path:{path_only_path}" in keys
+    assert stable_replay_key(_minimal_replay(episode_id=None, replay_id=None)).startswith(
+        "content:"
+    )
+    assert stable_replay_key(_minimal_replay(episode_id=None, replay_id=None)) in keys
 
 
 def test_bad_replay_is_recorded_without_aborting_other_files(tmp_path: Path) -> None:
@@ -200,8 +205,8 @@ def test_streaming_export_writes_compact_decision_references(tmp_path: Path) -> 
         "player_index": 0,
     }
     assert row["final_outcome"] == 1
-    assert row["source"]["replay_path"] == str(replay)
-    assert row["source"]["content_hash"]
+    assert row["source"]["source_path"] == str(replay)
+    assert row["source"]["raw_content_hash"]
     assert row["parser_contract_version"] == "replay_observation_parser_v2"
     assert not ({"card_instances", "global_snapshot", "memory_summary", "recent_events", "select_options"} & row.keys())
 
@@ -212,9 +217,19 @@ def test_streaming_export_writes_compact_decision_references(tmp_path: Path) -> 
     rebuilt_after_move = rebuild_replay_decision_from_reference(row, source_path=moved)
     assert rebuilt_after_move.decision_key == dataset_key_from_row(row)
     tampered = json.loads(json.dumps(row))
-    tampered["source"]["content_hash"] = "0" * 64
+    tampered["source"]["raw_content_hash"] = "0" * 64
     with pytest.raises(ValueError, match="content hash mismatch"):
         rebuild_replay_decision_from_reference(tampered)
+
+    fingerprint_changed = json.loads(json.dumps(payload))
+    fingerprint_changed["steps"][0][0]["observation"]["select"]["context"] = 99
+    changed_path = tmp_path / "fingerprint-changed.json"
+    changed_raw = json.dumps(fingerprint_changed).encode("utf-8")
+    changed_path.write_bytes(changed_raw)
+    tampered_source = json.loads(json.dumps(row))
+    tampered_source["source"]["raw_content_hash"] = hashlib.sha256(changed_raw).hexdigest()
+    with pytest.raises(ValueError, match="observation fingerprint mismatch"):
+        rebuild_replay_decision_from_reference(tampered_source, source_path=changed_path)
 
 
 def dataset_key_from_row(row: dict):
@@ -229,6 +244,7 @@ def test_missing_episode_ids_do_not_collide_within_jsonl(tmp_path: Path) -> None
         _minimal_replay(episode_id=None, replay_id=None),
         _minimal_replay(episode_id=None, replay_id=None),
     ]
+    rows[1]["steps"][1][0]["reward"] = -1
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
     dataset = ReplayDecisionDataset.from_paths([path])
     assert len(dataset) == 2
@@ -236,11 +252,45 @@ def test_missing_episode_ids_do_not_collide_within_jsonl(tmp_path: Path) -> None
     assert {sample.source_record_line for sample in dataset.samples} == {1, 2}
 
 
-def test_missing_episode_ids_use_zip_member_identity(tmp_path: Path) -> None:
+def test_missing_episode_ids_ignore_zip_member_identity(tmp_path: Path) -> None:
     replay = _minimal_replay(episode_id=None, replay_id=None)
     archive = tmp_path / "replays.zip"
-    assert stable_replay_key(replay, archive, archive_member="a.json") == "archive:a.json"
-    assert stable_replay_key(replay, archive, archive_member="b.json") == "archive:b.json"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("a.json", json.dumps(replay))
+        handle.writestr("nested/b.json", json.dumps(replay, indent=2))
+    with zipfile.ZipFile(archive) as handle:
+        first_replay = json.loads(handle.read("a.json"))
+        second_replay = json.loads(handle.read("nested/b.json"))
+    first = stable_replay_key(first_replay, archive, archive_member="a.json")
+    second = stable_replay_key(second_replay, archive, archive_member="nested/b.json")
+    assert first == second == f"content:{stable_replay_key(replay).split(':', 1)[1]}"
+
+
+def test_content_replay_key_survives_move_and_changes_with_content(tmp_path: Path) -> None:
+    replay = _minimal_replay(episode_id=None, replay_id=None)
+    path_a = tmp_path / "a.json"
+    path_b = tmp_path / "nested/b.json"
+    path_b.parent.mkdir()
+    path_a.write_text(json.dumps(replay), encoding="utf-8")
+    path_b.write_text(json.dumps(replay), encoding="utf-8")
+    assert ReplayDecisionDataset.from_paths([path_a])[0].replay_key == (
+        ReplayDecisionDataset.from_paths([path_b])[0].replay_key
+    )
+    changed = json.loads(json.dumps(replay))
+    changed["steps"][1][0]["reward"] = -1
+    assert stable_replay_key(changed) != stable_replay_key(replay)
+
+
+def test_identical_idless_replays_are_deduplicated(tmp_path: Path) -> None:
+    replay = _minimal_replay(episode_id=None, replay_id=None)
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps(replay), encoding="utf-8")
+    second.write_text(json.dumps(replay, indent=2), encoding="utf-8")
+    dataset = ReplayDecisionDataset.from_paths([first, second])
+    assert len(dataset) == 1
+    assert dataset.summary.replay_count == 1
+    assert dataset.summary.duplicate_replay_content_count == 1
 
 
 @pytest.mark.parametrize("bad_action", [["bad"], [None], [{"index": 0}]])
@@ -259,22 +309,97 @@ def test_invalid_action_payload_never_becomes_option_zero(
     assert any(error["stage"] == "action_alignment" for error in dataset.summary.parser_errors)
 
 
-def test_turn_owner_is_inferred_only_when_turn_contract_is_available(tmp_path: Path) -> None:
+def _replay_with_turn(
+    *,
+    agent_index: int = 0,
+    your_index: int = 0,
+    turn: int = 3,
+    first_player: int = 0,
+    explicit_owner: int | None = None,
+) -> dict:
     replay = _minimal_replay()
-    replay["steps"][0][0]["observation"]["current"] = {
-        "turn": 3,
+    if agent_index == 1:
+        replay["steps"] = [[{}, replay["steps"][0][0]], [{}, replay["steps"][1][0]]]
+    current = {
+        "turn": turn,
         "turnActionCount": 0,
-        "yourIndex": 0,
-        "firstPlayer": 0,
+        "yourIndex": your_index,
+        "firstPlayer": first_player,
         "players": [{}, {}],
     }
+    if explicit_owner is not None:
+        current["turnOwner"] = explicit_owner
+    replay["steps"][0][agent_index]["observation"]["current"] = current
+    return replay
+
+
+@pytest.mark.parametrize(
+    ("turn", "first_player", "your_index", "expected_owner", "expected_is_owner"),
+    [(3, 0, 0, 0, True), (4, 0, 0, 1, False), (3, 1, 1, 1, True), (4, 1, 1, 0, False)],
+)
+def test_turn_owner_uses_first_player_formula_and_current_view(
+    tmp_path: Path,
+    turn: int,
+    first_player: int,
+    your_index: int,
+    expected_owner: int,
+    expected_is_owner: bool,
+) -> None:
+    replay = _replay_with_turn(
+        agent_index=your_index,
+        your_index=your_index,
+        turn=turn,
+        first_player=first_player,
+    )
     path = tmp_path / "turn-owner.json"
     path.write_text(json.dumps(replay), encoding="utf-8")
     sample = ReplayDecisionDataset.from_paths([path])[0]
-    owner = build_replay_decision_contract(sample).match.is_turn_owner
-    assert owner.value is True
+    contract = build_replay_decision_contract(sample)
+    owner = contract.match.is_turn_owner
+    relative = contract.resources.turn_usage.turn_owner_relative
+    assert expected_owner == (your_index if expected_is_owner else 1 - your_index)
+    assert owner.value is expected_is_owner
+    assert relative.value == (0 if expected_is_owner else 1)
     assert owner.state.name == "PRESENT"
-    assert owner.inference_source == "INFERRED_AUDITED_TURN_RULE"
+    assert owner.inference_source == "INFERRED_TURN_FORMULA"
+
+
+def test_setup_turn_owner_is_unknown(tmp_path: Path) -> None:
+    replay = _replay_with_turn(turn=0, first_player=-1)
+    path = tmp_path / "setup.json"
+    path.write_text(json.dumps(replay), encoding="utf-8")
+    contract = build_replay_decision_contract(ReplayDecisionDataset.from_paths([path])[0])
+    assert contract.match.is_turn_owner.state.name == "UNKNOWN"
+    assert contract.resources.turn_usage.turn_owner_relative.state.name == "UNKNOWN"
+
+
+def test_agent_perspective_mismatch_is_recorded_without_sample(tmp_path: Path) -> None:
+    replay = _replay_with_turn(agent_index=0, your_index=1)
+    path = tmp_path / "perspective-mismatch.json"
+    path.write_text(json.dumps(replay), encoding="utf-8")
+    dataset = ReplayDecisionDataset.from_paths([path])
+    assert len(dataset) == 0
+    assert dataset.summary.agent_perspective_mismatch_count == 1
+    assert any(error["stage"] == "agent_perspective" for error in dataset.summary.parser_errors)
+
+
+def test_agent_perspective_match_generates_sample(tmp_path: Path) -> None:
+    replay = _replay_with_turn(agent_index=1, your_index=1, first_player=1)
+    path = tmp_path / "perspective-match.json"
+    path.write_text(json.dumps(replay), encoding="utf-8")
+    dataset = ReplayDecisionDataset.from_paths([path])
+    assert len(dataset) == 1
+    assert dataset.summary.agent_perspective_match_count == 1
+
+
+def test_explicit_turn_owner_conflict_is_recorded_without_sample(tmp_path: Path) -> None:
+    replay = _replay_with_turn(turn=3, first_player=0, explicit_owner=1)
+    path = tmp_path / "turn-owner-conflict.json"
+    path.write_text(json.dumps(replay), encoding="utf-8")
+    dataset = ReplayDecisionDataset.from_paths([path])
+    assert len(dataset) == 0
+    assert dataset.summary.turn_owner_conflict_count == 1
+    assert any(error["stage"] == "turn_owner_conflict" for error in dataset.summary.parser_errors)
 
 
 def test_full_deck_variant_is_order_insensitive() -> None:

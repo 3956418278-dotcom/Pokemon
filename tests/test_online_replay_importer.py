@@ -38,7 +38,7 @@ class FakeReplayClient:
 
 
 def test_online_replay_importer_uses_client_and_builds_dataset(tmp_path: Path) -> None:
-    replay_path = Path("data_from_submission/replays/episode-84817357-replay.json")
+    replay_path = Path("tests/fixtures/replay/episode-84817357-replay.json")
     if replay_path.exists():
         replay_bytes = replay_path.read_bytes()
     else:
