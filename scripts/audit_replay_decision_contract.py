@@ -22,10 +22,18 @@ from data.legal_options import (
     build_action_target,
     infer_action_semantics,
     option_equivalence_signature,
-    policy_loss_mask,
+    policy_mask_decision,
+    semantic_source_for_select,
+)
+from data.replay_dataset import (
+    ActionAlignmentError,
+    DECISION_SCHEMA_VERSION,
+    PARSER_CONTRACT_VERSION,
+    REFERENCE_SCHEMA_VERSION,
+    parse_action,
 )
 
-ORDER_AUDIT_CONTEXTS = {2, 15, 21, 22, 26, 27, 34}
+ORDER_AUDIT_CONTEXTS = {2, 5, 7, 8, 9, 15, 21, 22, 26, 27, 34}
 CONTEXT_SEMANTICS = {
     2: {
         "effect_kind": "game setup",
@@ -77,13 +85,28 @@ CONTEXT_SEMANTICS = {
         "semantic_evidence": "all options are forced and equivalent; the policy loss is masked",
     },
 }
+for _context, _engine_name, _meaning in (
+    (5, "ToBench", "cards moved to Bench; targetList follows action order"),
+    (7, "ToHand", "cards moved to hand; destination list/log order follows action order"),
+    (8, "Discard", "cards moved to discard; destination list/log order follows action order"),
+    (9, "ToDeck", "cards moved to deck; deck insertion precedes any later shuffle"),
+):
+    CONTEXT_SEMANTICS[_context] = {
+        "effect_kind": _engine_name,
+        "candidate_meaning": _meaning,
+        "order_changes_final_effect": "UNPROVEN",
+        "final_semantics": "ORDERED_INDEX_SEQUENCE",
+        "semantic_evidence": "engine setSelectedCardTarget preserves action order; no context-wide proof permits quotienting it out",
+    }
 
 _ZIP: zipfile.ZipFile | None = None
 _WRITE_REFERENCE_DATASET = False
+_ARCHIVE_PATH: str | None = None
 
 
 def _init_worker(archive: str, write_reference_dataset: bool) -> None:
-    global _WRITE_REFERENCE_DATASET, _ZIP
+    global _ARCHIVE_PATH, _WRITE_REFERENCE_DATASET, _ZIP
+    _ARCHIVE_PATH = archive
     _ZIP = zipfile.ZipFile(archive)
     _WRITE_REFERENCE_DATASET = write_reference_dataset
 
@@ -101,8 +124,6 @@ def _field_state(obj: Any, name: str) -> str:
     value = obj[name]
     if value is None:
         return FieldState.EXPLICIT_NULL.name
-    if isinstance(value, int) and value < 0:
-        return FieldState.UNKNOWN.name
     return FieldState.PRESENT.name
 
 
@@ -263,12 +284,21 @@ def _counter_dict() -> dict[str, Counter[Any]]:
 def _audit_member(name: str) -> dict[str, Any]:
     assert _ZIP is not None
     try:
-        replay = json.loads(_ZIP.read(name))
+        raw_replay = _ZIP.read(name)
+        replay = json.loads(raw_replay)
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "name": name}
 
     info = replay.get("info") or {}
     episode_id = info.get("EpisodeId")
+    replay_key = (
+        f"episode:{episode_id}"
+        if episode_id is not None
+        else f"replay:{replay['id']}"
+        if replay.get("id") is not None
+        else f"archive:{name}"
+    )
+    source_content_hash = hashlib.sha256(raw_replay).hexdigest()
     counters = _counter_dict()
     table: Counter[tuple[Any, ...]] = Counter()
     eq_types: Counter[tuple[Any, ...]] = Counter()
@@ -294,9 +324,23 @@ def _audit_member(name: str) -> dict[str, Any]:
             if not isinstance(agent_step, dict):
                 continue
             raw_action = agent_step.get("action")
-            action = [_int(value, 0) for value in raw_action] if isinstance(raw_action, list) else ([] if raw_action is None else [_int(raw_action, 0)])
+            try:
+                action = parse_action(raw_action)
+            except ActionAlignmentError as exc:
+                action = None
+                summary["action_alignment_errors"] += 1
+                if len(examples["action_alignment_error"]) < 3:
+                    examples["action_alignment_error"].append(
+                        {
+                            "episode_id": episode_id,
+                            "step": step_index,
+                            "player": player_index,
+                            "action": raw_action,
+                            "error": str(exc),
+                        }
+                    )
             decision = pending.pop(player_index, None)
-            if decision is not None:
+            if decision is not None and action is not None:
                 select = decision["select"]
                 options = select.get("option") or []
                 semantics = _semantics(select, action)
@@ -322,6 +366,11 @@ def _audit_member(name: str) -> dict[str, Any]:
                     target = build_action_target(
                         decision["observation"], action, ActionSemantics(semantics)
                     )
+                    mask_value, mask_reason = policy_mask_decision(select, target)
+                    summary[f"policy_mask_reason:{mask_reason}"] += 1
+                    summary[
+                        f"equivalence_resolution_status:{target.equivalence_resolution_status}"
+                    ] += 1
                     final_rewards = replay.get("rewards") or []
                     final_reward = (
                         final_rewards[player_index]
@@ -331,17 +380,28 @@ def _audit_member(name: str) -> dict[str, Any]:
                     if _WRITE_REFERENCE_DATASET:
                         decision_rows.append(
                             {
-                            "schema_version": "replay_decision_reference_v1",
+                            "schema_version": REFERENCE_SCHEMA_VERSION,
+                            "parser_contract_version": PARSER_CONTRACT_VERSION,
+                            "decision_schema_version": DECISION_SCHEMA_VERSION,
                             "decision_key": {
-                                "episode_id": _int(episode_id),
+                                "replay_key": replay_key,
+                                "episode_id": int(episode_id) if episode_id is not None else None,
                                 "decision_step_index": decision["step"],
                                 "action_step_index": step_index,
                                 "player_index": player_index,
                             },
-                            "source": {"replay_member": name},
+                            "source": {
+                                "source_kind": "ZIP_MEMBER",
+                                "replay_path": _ARCHIVE_PATH,
+                                "archive_member": name,
+                                "replay_record_line": None,
+                                "replay_id": replay.get("id"),
+                                "content_hash": source_content_hash,
+                            },
                             "observation_fingerprint": decision["fingerprint"],
                             "action": action,
                             "action_semantics": semantics,
+                            "semantic_source": semantic_source_for_select(select),
                             "action_target": asdict(target),
                             "select_type": _int(select.get("type")),
                             "select_context": _int(select.get("context")),
@@ -353,7 +413,8 @@ def _audit_member(name: str) -> dict[str, Any]:
                             "effect_presence": _field_state(select, "effect"),
                             "context_card_reference": select.get("contextCard"),
                             "context_card_presence": _field_state(select, "contextCard"),
-                            "policy_loss_mask": policy_loss_mask(select, target),
+                            "policy_loss_mask": mask_value,
+                            "policy_mask_reason": mask_reason,
                             "reward": agent_step.get("reward"),
                             "status": agent_step.get("status"),
                             "final_reward": final_reward,
@@ -492,6 +553,8 @@ def _audit_member(name: str) -> dict[str, Any]:
                     summary["selected_ability_with_explicit_detail_log"] += int(explicit > 0)
                     if len(examples["selected_ability"]) < 3:
                         examples["selected_ability"].append({"episode_id": episode_id, "decision_step": decision["step"], "action_step": step_index, "player": player_index, "selected_options": [options[index] for index in selected_ability], "next_log_types": [_int(log.get("type")) for log in logs if isinstance(log, dict)], "explicit_detail_log_fields": explicit})
+            elif decision is not None:
+                pass
             elif action:
                 summary["unpaired_nonempty_actions"] += 1
                 if len(action) == 60:
@@ -530,6 +593,27 @@ def _audit_member(name: str) -> dict[str, Any]:
             if current is None:
                 summary["select_without_current"] += 1
             else:
+                explicit_owner = next(
+                    (
+                        _int(current[field])
+                        for field in ("turnOwner", "turnPlayer", "currentPlayerIndex")
+                        if field in current and current[field] is not None
+                    ),
+                    None,
+                )
+                first_player = _int(current.get("firstPlayer"), -1)
+                turn_number = _int(current.get("turn"), -1)
+                inferred_owner = (
+                    first_player if turn_number % 2 == 1 else 1 - first_player
+                ) if first_player in (0, 1) and turn_number >= 1 else None
+                if explicit_owner in (0, 1):
+                    summary["explicit_turn_owner_count"] += 1
+                    if inferred_owner is not None and explicit_owner != inferred_owner:
+                        summary["conflicting_turn_owner_count"] += 1
+                elif inferred_owner is not None:
+                    summary["deterministically_inferred_turn_owner_count"] += 1
+                else:
+                    summary["ambiguous_turn_owner_count"] += 1
                 if "turnActionCount" not in current:
                     summary["turn_action_count_missing"] += 1
                 elif current.get("turnActionCount") is None:
@@ -706,6 +790,10 @@ def main() -> None:
             "select_context": context,
             "option_type": option_type,
             "action_semantics": semantics,
+            "semantic_source": semantic_source_for_select(
+                {"type": select_type, "context": context}
+            ),
+            "replay_support_evidence": "REPLAY_SUPPORTED",
             "decision_count": table[base + ("decisions",)],
             "selected_index_count": table[base + ("selected",)],
             "empty_action_count": table[base + ("empty",)],
@@ -819,6 +907,7 @@ def main() -> None:
             else "CONTROLLED_NORMALIZED_OUTCOMES_DIFFER"
         )
         contract = CONTEXT_SEMANTICS[context]
+        sample_count = ordered_stats[semantic_key + ("samples",)]
         ordered_rows.append(
             {
                 "select_type": select_type,
@@ -828,8 +917,19 @@ def main() -> None:
                 "candidate_meaning": contract["candidate_meaning"],
                 "order_changes_final_effect": contract["order_changes_final_effect"],
                 "final_action_semantics": contract["final_semantics"],
+                "semantic_source": (
+                    "RULE_CONFIRMED"
+                    if context not in {5, 7, 8, 9, 22}
+                    else "REPLAY_SUPPORTED"
+                    if context == 22
+                    else "UNRESOLVED"
+                ),
+                "replay_support_evidence": (
+                    "REPLAY_SUPPORTED" if sample_count > 0 else "REPLAY_NO_EVIDENCE"
+                ),
+                "replay_can_prove_order_invariance": "NO",
                 "semantic_evidence": contract["semantic_evidence"],
-                "sample_count": ordered_stats[semantic_key + ("samples",)],
+                "sample_count": sample_count,
                 "max_option_count": ordered_stats[semantic_key + ("max_options",)],
                 "max_selected_count": ordered_stats[semantic_key + ("max_selected",)],
                 "source_areas": json.dumps(source_areas, sort_keys=True),
@@ -856,7 +956,7 @@ def main() -> None:
         writer.writerows(ordered_rows)
 
     report = {
-        "schema_version": "replay_decision_contract_audit_v1",
+        "schema_version": "replay_decision_contract_audit_v2",
         "archive": str(args.archive),
         "requested_replays": len(names),
         "successful_replays": len(names) - len(errors),
@@ -883,8 +983,8 @@ def main() -> None:
             "option_type",
             "source_zone",
             "target_zone",
-            "source_identity_and_dynamic_state_without_serial",
-            "target_identity_and_dynamic_state_without_serial",
+            "source_identity_and_dynamic_state_with_serial_unless_rule_confirmed",
+            "target_identity_and_dynamic_state_with_serial_unless_rule_confirmed",
             "detail_reference",
             "effect_reference",
             "effect_presence_state",
@@ -915,9 +1015,9 @@ def main() -> None:
     }
     (args.output_dir / "audit.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     equivalence_contract = {
-        "schema_version": "legal_option_equivalence_v1",
+        "schema_version": "legal_option_equivalence_v2",
         "rule": "Two options share a class only when every normalized field below is equal.",
-        "serial_rule": "Resolved entity serials and names are removed; unresolved references retain raw indices or direct identity conservatively.",
+        "serial_rule": "Serial identity is retained unless an audited engine rule proves interchangeable copies; unresolved references retain raw indices or direct identity.",
         "fields": report["equivalence_key_fields"],
         "single_target": "sum probability over all members of the demonstrated class",
         "unordered_target": "selected member count per class plus total selected count",
@@ -929,7 +1029,7 @@ def main() -> None:
     )
     if args.write_reference_dataset:
         manifest = {
-            "schema_version": "replay_decision_reference_dataset_v1",
+            "schema_version": "replay_decision_reference_dataset_v2",
             "storage_contract": "Raw observations remain in the replay ZIP. Decision rows store keys, targets, labels, and replay_member references only.",
             "replay_archive": str(args.archive),
             "decision_file": "decisions.jsonl.gz",

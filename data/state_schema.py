@@ -86,7 +86,7 @@ GLOBAL_FEATURE_DIM = 32
 DECISION_FEATURE_DIM = 16
 MATCH_FEATURE_DIM = 16
 LEDGER_FEATURE_DIM = 20
-EVENT_FEATURE_DIM = 16
+EVENT_FEATURE_DIM = 19
 MAX_RECENT_EVENTS = 32
 
 NUMERICAL_FEATURE_NAMES = (
@@ -358,10 +358,10 @@ class GameEvent:
     is_reverse: bool = False
     identity_visible: bool = False
     observation_age: int = 0
-    event_position_in_batch: int = 0
-    observed_turn: int = 0
-    turn_delta: int = 0
-    position_in_turn: int = 0
+    batch_position: int = 0
+    observed_at_turn: int = 0
+    observed_at_turn_action_count: int = 0
+    turn_age: int = 0
     field_states: dict[str, FieldState] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 

@@ -162,8 +162,8 @@ def test_events_keep_missingness_batch_position_and_player_relative_age() -> Non
     first = parse_observation(_observation())
     event = first.events[0]
     assert event.actor_relative == 0
-    assert event.event_position_in_batch == 0
-    assert event.position_in_turn == 2
+    assert event.batch_position == 0
+    assert event.observed_at_turn_action_count == 2
     assert event.identity_visible
     assert event.field_states["card_id"] is FieldState.PRESENT
     assert event.field_states["coin_result"] is FieldState.MISSING
@@ -174,7 +174,7 @@ def test_events_keep_missingness_batch_position_and_player_relative_age() -> Non
     second_observation["logs"] = []
     memory.update_from_parsed(parse_observation(second_observation))
     assert memory.recent_events[0].observation_age == 1
-    assert memory.recent_events[0].turn_delta == 1
+    assert memory.recent_events[0].turn_age == 1
     # Memory owns temporal mutation; the arrival batch remains unchanged.
     assert first.events[0].observation_age == 0
 
@@ -186,12 +186,65 @@ def test_anonymous_hidden_pool_flows_are_separate_from_card_id_memory() -> None:
     ]
     memory = GameMemoryState().update_from_parsed(parse_observation(observation))
     pools = memory.anonymous_hidden_pools_record(your_index=0)
-    assert pools.anonymous_zone_transitions_by_side[1] == {
+    assert pools.self_unknown_deck_count == 45
+    assert pools.self_unknown_prize_count == 2
+    assert pools.cumulative_anonymous_zone_transitions_by_side[1] == {
         "anonymous_deck_out_count": 2,
         "anonymous_hand_in_count": 2,
     }
     assert pools.opponent_unknown_hand_count == 6
-    assert memory.card_id_memory_records(your_index=0)
+    records = memory.card_id_memory_records(your_index=0)
+    assert records
+    assert records[0].known_serial_count >= 1
+    assert records[0].visible_observation_count >= records[0].known_serial_count
+
+
+def test_anonymous_single_move_does_not_clear_known_serial_locations() -> None:
+    initial = _observation()
+    initial["logs"] = []
+    initial["current"]["players"][0]["hand"] = [
+        _card(40, 13, 0),
+        _card(41, 14, 0),
+        _card(42, 15, 0),
+    ]
+    initial["current"]["players"][0]["handCount"] = 3
+    memory = GameMemoryState().update_from_parsed(parse_observation(initial))
+
+    moved = _observation()
+    moved["current"]["players"][0]["hand"] = initial["current"]["players"][0]["hand"]
+    moved["current"]["players"][0]["handCount"] = 3
+    moved["logs"] = [
+        {"type": 6, "playerIndex": 0, "fromArea": 2, "toArea": 3, "quantity": 1}
+    ]
+    memory.update_from_parsed(parse_observation(moved))
+    assert [memory.serials[serial].current_area for serial in (13, 14, 15)] == [2, 2, 2]
+    pools = memory.anonymous_hidden_pools_record(your_index=0)
+    assert pools.cumulative_anonymous_zone_transitions_by_side[0][
+        "anonymous_hand_out_count"
+    ] == 1
+
+
+def test_field_specific_unknown_sentinels_do_not_hide_valid_negative_values() -> None:
+    observation = _observation()
+    observation["current"]["firstPlayer"] = -1
+    observation["current"]["result"] = -1
+    observation["select"]["remainDamageCounter"] = -10
+    parsed = parse_observation(observation)
+    states = parsed.global_snapshot.field_states
+    assert states["firstPlayer"] is FieldState.UNKNOWN
+    assert states["result"] is FieldState.UNKNOWN
+    assert states["select.remainDamageCounter"] is FieldState.PRESENT
+
+
+def test_missing_null_and_unknown_field_states_are_distinct() -> None:
+    observation = _observation()
+    del observation["current"]["energyAttached"]
+    observation["select"]["contextCard"] = None
+    observation["current"]["firstPlayer"] = -1
+    states = parse_observation(observation).global_snapshot.field_states
+    assert states["energyAttached"] is FieldState.MISSING
+    assert states["select.contextCard"] is FieldState.EXPLICIT_NULL
+    assert states["firstPlayer"] is FieldState.UNKNOWN
 
 
 def test_dynamic_batch_distinguishes_missing_hp_from_real_zero_and_preserves_serial_zero() -> None:
@@ -228,6 +281,16 @@ def test_copy_count_is_grouped_without_losing_serials() -> None:
     hand = [item for item in parsed.card_instances if item.zone == "hand" and item.card_id == 40]
     assert [item.serial for item in hand] == [13, 14]
     assert [item.copy_count for item in hand] == [2, 2]
+
+
+def test_select_deck_card_instance_is_currently_in_looking_zone() -> None:
+    observation = _observation()
+    observation["select"]["deck"] = [_card(77, 707, 0)]
+    parsed = parse_observation(observation)
+    instance = next(item for item in parsed.card_instances if item.serial == 707)
+    assert instance.area == AREA_IDS["LOOKING"]
+    assert instance.zone == "select.deck"
+    assert instance.source == "select.deck"
 
 
 def test_unknown_energy_enum_invalidates_energy_supervision() -> None:

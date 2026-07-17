@@ -115,6 +115,9 @@ def test_card_id_split_keeps_all_details_with_parent(dataset: CardDataset) -> No
     assert not (index_sets[0] & index_sets[1] or index_sets[0] & index_sets[2] or index_sets[1] & index_sets[2])
     assert set.union(*index_sets) == set(dataset.indices)
     for part in first:
+        # This split monitors optimization within one frozen card pool; it is
+        # deliberately not an unseen-card/train-only-vocabulary benchmark.
+        assert part.schema is dataset.schema
         for canonical_index in part.indices[:20]:
             record = dataset.records[canonical_index]
             assert all(

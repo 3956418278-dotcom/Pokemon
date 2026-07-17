@@ -25,9 +25,6 @@ static_card/outputs/
 static_card/artifacts/
 static_card/checkpoints/
 static_card/logs/
-data_from_submission/replay_audit/
-data_from_submission/replay_dataset/
-data_from_submission/replays/
 *.pt
 *.pth
 *.ckpt

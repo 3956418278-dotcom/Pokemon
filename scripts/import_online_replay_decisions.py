@@ -63,7 +63,6 @@ def main() -> None:
         help="Reserve the most recent N days from the mounted index for validation/test instead of training.",
     )
     parser.add_argument("--import-split", choices=["train", "reserved"], default="train")
-    parser.add_argument("--include-no-select", action="store_true")
     parser.add_argument("--controlled-agent", type=int, action="append")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--include-private-episodes", action="store_true")
@@ -120,7 +119,6 @@ def main() -> None:
     decision_summary = export_replay_decisions(
         replay_paths,
         args.output_dir,
-        include_no_select=args.include_no_select,
         controlled_agents=controlled,
         max_samples=args.max_samples,
     )

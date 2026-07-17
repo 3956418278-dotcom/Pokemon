@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import gzip
 from pathlib import Path
+
+import pytest
 
 from data.replay_dataset import (
     ReplayDecisionDataset,
@@ -10,6 +13,8 @@ from data.replay_dataset import (
     collate_replay_decisions,
     export_replay_decisions,
     iter_replay_paths,
+    rebuild_replay_decision_from_reference,
+    stable_replay_key,
 )
 
 _KERNEL_PATH = Path("kaggle/kernels/replay_extract/extract_popular_decks.py")
@@ -22,6 +27,7 @@ build_card_pair_frequency_rows = _KERNEL.build_card_pair_frequency_rows
 parse_replay = _KERNEL.parse_replay
 stable_daily_replay_selection = _KERNEL.stable_daily_replay_selection
 write_daily_outputs = _KERNEL.write_daily_outputs
+build_popular_decks = _KERNEL.build_popular_decks
 
 
 REPLAY_PATH = Path("data_from_submission/replays/episode-84817357-replay.json")
@@ -121,13 +127,16 @@ def test_replay_provenance_is_preserved_in_index_and_collate(tmp_path: Path) -> 
     assert metadata["source_date"] == "2026-07-10"
 
     contract = build_replay_decision_contract(sample, final_outcome=1)
-    assert contract.schema_version == "replay_decision_contract_v1"
+    assert contract.schema_version == "replay_decision_contract_v2"
     assert contract.key.decision_step_index == 0
     assert contract.targets.final_outcome == 1
     assert contract.targets.legal_action.chosen_option_indices == ()
     assert contract.match.is_turn_owner.state.name == "UNKNOWN"
     assert contract.hidden_belief is None
     assert contract.hidden_belief_state.name == "NOT_APPLICABLE"
+    assert build_replay_decision_contract(
+        sample, hidden_belief_enabled=True
+    ).hidden_belief_state.name == "UNKNOWN"
     assert metadata["episode_key"] == "episode:85109456"
 
 
@@ -184,6 +193,7 @@ def test_streaming_export_writes_compact_decision_references(tmp_path: Path) -> 
     ) as handle:
         row = json.loads(handle.read().strip())
     assert row["decision_key"] == {
+        "replay_key": "episode:85109456",
         "episode_id": 85109456,
         "decision_step_index": 0,
         "action_step_index": 1,
@@ -191,7 +201,102 @@ def test_streaming_export_writes_compact_decision_references(tmp_path: Path) -> 
     }
     assert row["final_outcome"] == 1
     assert row["source"]["replay_path"] == str(replay)
+    assert row["source"]["content_hash"]
+    assert row["parser_contract_version"] == "replay_observation_parser_v2"
     assert not ({"card_instances", "global_snapshot", "memory_summary", "recent_events", "select_options"} & row.keys())
+
+    rebuilt = rebuild_replay_decision_from_reference(row)
+    assert rebuilt.decision_key == dataset_key_from_row(row)
+    moved = tmp_path / "moved-replay.json"
+    moved.write_bytes(replay.read_bytes())
+    rebuilt_after_move = rebuild_replay_decision_from_reference(row, source_path=moved)
+    assert rebuilt_after_move.decision_key == dataset_key_from_row(row)
+    tampered = json.loads(json.dumps(row))
+    tampered["source"]["content_hash"] = "0" * 64
+    with pytest.raises(ValueError, match="content hash mismatch"):
+        rebuild_replay_decision_from_reference(tampered)
+
+
+def dataset_key_from_row(row: dict):
+    from data.decision_schema import DecisionKey
+
+    return DecisionKey(**row["decision_key"])
+
+
+def test_missing_episode_ids_do_not_collide_within_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "replays.jsonl"
+    rows = [
+        _minimal_replay(episode_id=None, replay_id=None),
+        _minimal_replay(episode_id=None, replay_id=None),
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    dataset = ReplayDecisionDataset.from_paths([path])
+    assert len(dataset) == 2
+    assert len({sample.decision_key for sample in dataset.samples}) == 2
+    assert {sample.source_record_line for sample in dataset.samples} == {1, 2}
+
+
+def test_missing_episode_ids_use_zip_member_identity(tmp_path: Path) -> None:
+    replay = _minimal_replay(episode_id=None, replay_id=None)
+    archive = tmp_path / "replays.zip"
+    assert stable_replay_key(replay, archive, archive_member="a.json") == "archive:a.json"
+    assert stable_replay_key(replay, archive, archive_member="b.json") == "archive:b.json"
+
+
+@pytest.mark.parametrize("bad_action", [["bad"], [None], [{"index": 0}]])
+def test_invalid_action_payload_never_becomes_option_zero(
+    tmp_path: Path, bad_action: list[object]
+) -> None:
+    replay = _minimal_replay()
+    replay["steps"][0][0]["observation"]["select"]["option"] = [{"type": 1}]
+    replay["steps"][0][0]["observation"]["select"]["minCount"] = 1
+    replay["steps"][0][0]["observation"]["select"]["maxCount"] = 1
+    replay["steps"][1][0]["action"] = bad_action
+    path = tmp_path / "bad-action.json"
+    path.write_text(json.dumps(replay), encoding="utf-8")
+    dataset = ReplayDecisionDataset.from_paths([path])
+    assert len(dataset) == 0
+    assert any(error["stage"] == "action_alignment" for error in dataset.summary.parser_errors)
+
+
+def test_turn_owner_is_inferred_only_when_turn_contract_is_available(tmp_path: Path) -> None:
+    replay = _minimal_replay()
+    replay["steps"][0][0]["observation"]["current"] = {
+        "turn": 3,
+        "turnActionCount": 0,
+        "yourIndex": 0,
+        "firstPlayer": 0,
+        "players": [{}, {}],
+    }
+    path = tmp_path / "turn-owner.json"
+    path.write_text(json.dumps(replay), encoding="utf-8")
+    sample = ReplayDecisionDataset.from_paths([path])[0]
+    owner = build_replay_decision_contract(sample).match.is_turn_owner
+    assert owner.value is True
+    assert owner.state.name == "PRESENT"
+    assert owner.inference_source == "INFERRED_AUDITED_TURN_RULE"
+
+
+def test_full_deck_variant_is_order_insensitive() -> None:
+    previous = _KERNEL.MIN_GROUP_GAMES
+    _KERNEL.MIN_GROUP_GAMES = 1
+    try:
+        deck = [1] * 30 + [2] * 30
+        rows = [
+            {"signature": "fixture", "deck": deck, "won": True, "reward": 1},
+            {"signature": "fixture", "deck": list(reversed(deck)), "won": False, "reward": -1},
+        ]
+        group = build_popular_decks(rows)[0]
+        assert group["trainer_variant_count"] == 1
+        assert group["representative_count"] == 2
+    finally:
+        _KERNEL.MIN_GROUP_GAMES = previous
+
+
+def test_missing_card_metadata_fails_instead_of_building_empty_signatures(monkeypatch) -> None:
+    monkeypatch.setattr(_KERNEL, "find_card_data_csv", lambda: None)
+    with pytest.raises(FileNotFoundError, match="required.*searched"):
+        _KERNEL.load_card_table()
 
 
 def test_complete_deck_observations_and_presence_statistics(tmp_path: Path) -> None:

@@ -1,39 +1,42 @@
 # Replay decision data contract
 
-This document freezes the model-facing data boundary before the staged model
-changes. It is intentionally independent from any one encoder implementation.
-
-## Decision identity and action alignment
-
-The primary key is:
+This is the versioned, model-facing Replay contract. The current versions are:
 
 ```text
-episode_id + decision_step_index + action_step_index + player_index
+decision contract: replay_decision_contract_v2
+compact reference: replay_decision_reference_v2
+observation parser: replay_observation_parser_v2
 ```
 
-For each player, extraction performs these operations in order:
+## Identity, alignment, and compact references
+
+The formal primary key is:
 
 ```text
-bind current agent_step.action to the previous pending decision
-close that pending decision
-deduplicate the current policy-visible observation
-apply the new log batch and current snapshot to that player's memory
-create a pending decision when observation.select is present
+replay_key + episode_id? + decision_step_index + action_step_index + player_index
 ```
 
-The fingerprint covers canonical `current`, `logs`, and `select`. It is an audit
-field, not the primary key. A 60-card initial deck submission without a pending
-decision is configuration input and is excluded from behavior cloning.
+`replay_key` is non-empty and is selected in this order: `EpisodeId`, replay
+`id`, ZIP member/JSONL record identity, normalized source path. `episode_id`
+remains nullable metadata. A JSONL line is part of source identity, so two
+records without Episode IDs cannot collide.
 
-Formal exports are reference datasets. They retain the primary key,
-`replay_member`/source path, action targets, supervision, and audit fields. They
-do not copy observations, logs, Card Instances, or Memory snapshots. Those are
-rebuilt from the source Replay at load time.
+Only actual `select` decision points enter behavior cloning. The former
+`include_no_select` option was removed because it never produced a defined
+training sample. A 60-card deck action without a pending decision is
+configuration, not policy supervision. Actions accept integers and integer
+strings; invalid values (including a list element of `None`) produce an
+`ActionAlignmentError`, consume no label, and are never replaced with option 0.
 
-## Presence states
+A compact reference contains the key, source kind/path or archive, member or
+JSONL line, source content hash, observation fingerprint, parser version,
+decision schema version, action target, and supervision. It does not copy the
+observation. `rebuild_replay_decision_from_reference` validates the content
+hash, fingerprint, key, and both versions and fails explicitly on any mismatch.
 
-Every nullable, missing, unknown, or inapplicable scalar/reference carries one
-of the following states independently from its placeholder value:
+## Missingness
+
+Every optional model-facing value is paired with one of:
 
 ```text
 PRESENT
@@ -43,220 +46,167 @@ NOT_APPLICABLE
 EXPLICIT_NULL
 ```
 
-The placeholder value must never be interpreted without this state. Detail use
-uses the narrower `TRUE/FALSE/UNKNOWN/NOT_APPLICABLE` contract.
+Sentinels are field-specific. `firstPlayer=-1` and `result=-1` are `UNKNOWN`;
+an unrelated negative numeric value remains `PRESENT`. Missing fields and
+explicit nulls remain distinct. Placeholder values are consumed only together
+with their state/mask. A derived field is `PRESENT` only when every required
+input is valid; for example, Bench free slots require both `benchMax` and
+`bench`.
 
-Both decision references are retained:
+`effect_reference` and `context_card_reference` retain independent states and
+never overwrite each other.
 
-```text
-effect_reference + effect_presence
-context_card_reference + context_card_presence
-```
+## Card instances, zones, and memory
 
-Neither globally overrides the other.
+Every visible serial remains a separate Card Instance. `select.deck` represents
+a currently exposed choice list, so both its Card Instance and legal-option
+source zone are `LOOKING` (12); `source="select.deck"` preserves origin. Tool
+and Energy child options point their target zone to the actual parent entity's
+zone.
 
-## Serial instances and Card ID memory
+The current snapshot has priority for exact serial positions. An anonymous log
+updates cumulative anonymous zone flow only; it never clears or guesses the
+position of every known serial in `fromArea`. `quantity` changes aggregate flow,
+not serial identity.
 
-Every currently visible card that can be referenced by an option remains a
-serial-level instance. This includes hand, discard, board, attachments,
-evolution components, `looking`, and `select.deck`. The parser may expose a
-`copy_count` feature, but it does not collapse those instances.
-
-The serial registry is the only mutable historical identity store. Ledger
-counts are derived views. Ledger and belief are merged per side and Card ID into
-`[CARD_ID_MEMORY]`; the contract materializes instance-to-memory edge indices
-for the bidirectional `INSTANCE_OF_CARD_ID` / `CARD_ID_HAS_INSTANCE` relations.
-The static summary is joined by `card_id` during tokenization rather than copied
-into every data record.
-
-## Legal action target
-
-Every sample records exactly one action semantic:
+Anonymous pools separate current snapshot-derived quantities from cumulative
+flow:
 
 ```text
-SINGLE_INDEX
-UNORDERED_UNIQUE_SUBSET
-ORDERED_INDEX_SEQUENCE
-INDEX_MULTISET
-COUNT_VALUE
+self_unknown_deck_count
+self_unknown_prize_count
+opponent_unknown_hand_count
+opponent_unknown_deck_count
+opponent_unknown_prize_count
+cumulative_anonymous_zone_transitions_by_side
 ```
 
-The target contains raw chosen option indices, an equivalence-class ID for each
-option, selected counts per class, an ordered class sequence only when order is
-semantic, and a resolved count value for `COUNT_VALUE` when the option exposes
-`number`.
-
-Equivalence resolution substitutes referenced source/target state for raw
-indices and removes interchangeable serial identity. If a reference cannot be
-resolved, its raw index remains in the signature, preventing an unsafe merge.
-
-The complete equality key is:
+Card ID memory is derived from the serial registry and uses names matching its
+calculation:
 
 ```text
-select type and context
-option type
-source and target zone
-source and target card identity plus all visible dynamic state, without serial/name
-detail / attack / skill / ability reference
-effect reference and context-card reference, kept separately
-missingness state for decision references and every option field
-energy, quantity, number, special-condition, and other resolution fields
-source and target owner
-unresolved raw indices or direct cardId+serial as conservative fallback
+currently_exact_zone_counts
+ambiguous_serial_count
+known_serial_count
+visible_observation_count
+movement_event_count
+first_known_turn
+last_known_turn
 ```
 
-Card ID alone is never sufficient. Direct `cardId+serial` options are first
-resolved against current visible instances; serial is removed only after
-successful resolution.
+It does not call observation count a reveal count and does not duplicate belief
+predictions.
 
-The final key produces 1,272,363 equivalence groups in 555,201 decisions. Group
-size has median 2, P99 6, and maximum 21. Replay actions select a non-first
-member of an equivalent group 46,686 times. Since every member is explicitly
-listed by the engine as a legal option, class members are individually accepted;
-the observed non-first selections additionally confirm that the environment is
-not tied to the first serial. This supports class marginalization without
-claiming that Card-ID equality alone establishes equivalence.
+## Temporal events
 
-Unordered subset training predicts the selected class counts/cardinality and
-uses fixed-cardinality subset dynamic programming. It does not enumerate label
-permutations.
-
-For option weights `w_j = exp(score_j)`, cardinality `k`, equivalence groups
-`G_g`, and demonstrated group counts `n_g`, the exact group-aware subset term is:
+Replay logs do not establish their original occurrence timestamp. Events use
+observation-relative names:
 
 ```text
-L_subset = -sum_g log e_{n_g}({w_j : j in G_g})
-           + log e_k({w_j : all j})
+observed_at_turn
+observed_at_turn_action_count
+batch_position
+observation_age
+turn_age
 ```
 
-where `e_r` is the degree-`r` elementary symmetric polynomial computed by the
-standard descending fixed-cardinality DP. The full target also includes the
-Count Head loss for `k`. This sums over every legal member subset with the same
-group-count target, costs `O(Kk)`, and never penalizes an arbitrary serial choice
-inside an equivalence group. For `SINGLE_INDEX`, probability is summed over the
-demonstrated equivalence class. For `COUNT_VALUE`, supervision is
-`select.option[action[0]].number`, with value-to-index mapping retained only for
-engine inference.
+Batch order is preserved and reverse logs keep an independent flag. Event
+features contain batch position, observation age, turn age, observed turn, and
+observed turn action count; the version-2 event dimension is 19.
 
-## Residual hidden-zone allocation
+## Legal-option equivalence and action semantics
 
-Exact hidden copies are fixed before probabilistic allocation:
+Each option key includes select type/context, option type, source and target
+entity/owner/zone, all visible dynamic state, detail/effect/context-card
+references, every settlement field, and field missingness. Explicit empty lists
+are not replaced by fallback data. Missing Card ID does not permit name removal.
+Serial is retained unless an audited engine rule proves different visible
+copies interchangeable.
+
+Resolution status is one of:
 
 ```text
-u_c = expected_hidden_count_c - sum_z exact_hidden_count[c,z]
-q_z = observed_zone_count_z - sum_c exact_hidden_count[c,z]
+FULLY_RESOLVED
+PARTIALLY_RESOLVED
+UNRESOLVED
 ```
 
-Both marginals must be non-negative and have equal total mass. IPF receives
-only `u_c` and `q_z` and outputs `expected_zone_count`. It does not output or
-imply presence probability. `probability_present` is a separately supervised
-head. `zone_entropy` is the entropy of the unresolved-copy zone allocation.
+Only `FULLY_RESOLVED` options may merge automatically. Class IDs are local to a
+sample and have no cross-sample meaning.
 
-The deck feature is named
-`deck_archetype_compatibility_distribution`; it is not claimed to be a
-calibrated Bayesian posterior. Archetypes, priors, and co-occurrence statistics
-are fitted from the training time window only.
+The action target retains raw indices, class capacities, chosen class counts,
+selected count, ordered class sequence when applicable, and count-value mapping.
+The conservative context table is:
 
-## Belief recall and rollout
+| select.type | context | semantic source | result |
+|---:|---:|---|---|
+| 1 | 2 | `RULE_CONFIRMED` | `UNORDERED_UNIQUE_SUBSET` |
+| 1 | 5 | `UNRESOLVED` | `ORDERED_INDEX_SEQUENCE` |
+| 1 | 7 | `UNRESOLVED` | `ORDERED_INDEX_SEQUENCE` |
+| 1 | 8 | `UNRESOLVED` | `ORDERED_INDEX_SEQUENCE` |
+| 1 | 9 | `UNRESOLVED` | `ORDERED_INDEX_SEQUENCE` |
+| 1 | 15 | `RULE_CONFIRMED` | `UNORDERED_UNIQUE_SUBSET` |
+| 1 | 21 | `RULE_CONFIRMED` | `UNORDERED_UNIQUE_SUBSET` |
+| 1 | 22 | `REPLAY_SUPPORTED` sequential settlement | `ORDERED_INDEX_SEQUENCE` |
+| 2 | 26 | `RULE_CONFIRMED` | `UNORDERED_UNIQUE_SUBSET` |
+| 2 | 27 | `RULE_CONFIRMED` | `UNORDERED_UNIQUE_SUBSET` |
+| 5 | 34 | `RULE_CONFIRMED` | `UNORDERED_UNIQUE_SUBSET` |
 
-Opponent Card ID recall reserves slots for presence/count, uncertainty,
-decision-conditioned tactical relevance, and archetype representatives. The
-tail token retains omitted expected mass, count summaries, and uncertainty.
+The audit reports manual rule status, Replay sample support, and whether Replay
+can prove invariance separately. Replay acceptance alone is supporting evidence,
+not automatic rule confirmation. Contexts 5, 7, 8, and 9 remain ordered until
+card/effect rules and settlement evidence satisfy the unordered proof burden.
+In the numeric Replay API these map (after the engine's `enum - 1`
+serialization) to `ToBench`, `ToHand`, `Discard`, and `ToDeck`. The engine's
+`setSelectedCardTarget` copies action indices into `targetList` in action order;
+destination/log order therefore cannot be erased by a context-wide assumption.
 
-The frozen schema supports staged activation:
+## Policy-loss mask
+
+The mask is computed after semantics and equivalence resolution. Every row has
+a `policy_mask_reason`, including:
 
 ```text
-Facts
-Events/Ledger
-simple Belief
-Deck Compatibility
-Residual IPF
-joint policy/Belief/Value training
+SINGLE_LEGAL_OPTION
+ONE_COUNT_VALUE
+ONE_FEASIBLE_CLASS_TARGET
+FORCED_FULL_SUBSET
+UNRESOLVED_EQUIVALENCE
+REAL_POLICY_CHOICE
 ```
 
-Inactive modules emit masked placeholders; field positions and meanings do not
-change between stages.
+Unresolved equivalence, variable counts, or ordered sequences retain policy
+loss. Masking is allowed only for one engine option, one count value, or a
+fully-resolved action space with one feasible semantic result.
 
-## Frozen eight-class record
+## Turn ownership
 
-`build_replay_decision_contract()` materializes the following in memory. It is
-not another persisted copy of the Replay.
+Turn owner uses an explicit engine field when present. Otherwise, for a
+two-player non-setup state with valid `firstPlayer` and `turn`, the engine rule
+`((turn + 1) ^ firstPlayer) & 1` infers the owner and records
+`INFERRED_AUDITED_TURN_RULE`. Setup, missing, or conflicting cases remain
+`UNKNOWN`; select presence alone is never treated as ownership because forced
+effects may ask the non-turn player to act. The audit reports explicit,
+deterministically inferred, ambiguous, and conflicting counts.
 
-1. **Match Context** — `turn`, visible `turnActionCount`, starting-player flag,
-   and turn-owner state. The Replay has no explicit turn-owner field, so that
-   field remains `UNKNOWN`; parity is not guessed.
-2. **Resource Context** — self/opponent deck, hand, prize, discard and free
-   Bench counts, plus current-turn usage flags, each with its own field state.
-3. **Card Instances** — every visible and option-referenceable serial remains a
-   separate instance, including hand, discard, board, attachments, evolution
-   components, `looking`, and `select.deck`.
-4. **Temporal Memory** — the last 32 visible events, the serial registry as the
-   only mutable identity truth, anonymous HAND/DECK/PRIZE flow counters, and
-   Card ID memory derived from that registry.
-5. **Hidden Belief** — staged fields for deck-archetype compatibility,
-   independent presence prediction, and residual-IPF expected zone counts.
-6. **Decision Context** — select type/context/count constraints and separate
-   effect/context-card references.
-7. **Legal Options** — raw legal options in memory plus equivalence classes and
-   semantic action targets.
-8. **Training Targets** — BC target, policy-loss mask, final outcome, and a
-   reference to hidden truth in the source Replay.
+## Deferred training systems
 
-Unknown sentinels such as `firstPlayer=-1` are encoded as `UNKNOWN` and receive
-a neutral placeholder value. They never enter a normal binary embedding as
-`-1`.
-
-## Audited multi-select contexts
-
-The full 7,500-Replay audit contains 1,128,724 aligned decisions. The seven
-previously conservative contexts resolve as follows:
-
-| select.type | context | option.type | samples | max options | max selected | candidate/effect | frozen semantics |
-|---:|---:|---:|---:|---:|---:|---|---|
-| 1 | 2 | 3 | 1,806 | 5 | 4 | setup Basic Pokémon placed on Bench | `UNORDERED_UNIQUE_SUBSET` |
-| 1 | 15 | 3 | 53 | 6 | 3 | Slowking copies Kyurem Trifrost; three equal-damage targets | `UNORDERED_UNIQUE_SUBSET` |
-| 1 | 21 | 3 | 128 | 4 | 2 | Glass Trumpet/Janine target Pokémon set | `UNORDERED_UNIQUE_SUBSET` |
-| 1 | 22 | 3 | 7,789 | 15 | 5 | Energy sources, each followed by a target decision | `ORDERED_INDEX_SEQUENCE` |
-| 2 | 26 | 5 | 326 | 11 | 7 | attached Energy subset discarded for attack damage | `UNORDERED_UNIQUE_SUBSET` |
-| 2 | 27 | 4 | 107 | 4 | 2 | Tool Scrapper target set | `UNORDERED_UNIQUE_SUBSET` |
-| 5 | 34 | 15 | 1,238 | 4 | 4 | forced equivalent Risky Ruins triggers | `UNORDERED_UNIQUE_SUBSET` |
-
-Context 22 is genuinely sequential: the engine consumes chosen Energy indices
-in action order and opens one subsequent target select for each Energy, so
-changing order can change Energy-to-target pairing. For the other six, the rule
-and observed logs depend on membership/count rather than order.
-
-No two samples had identical normalized pre-state, selected set, and decision
-references. Cross-episode normalized comparisons are therefore retained as
-coarse supporting evidence, not presented as controlled proof. The audit CSV
-contains both exact and coarse comparison counts. Context 34 has no policy
-freedom when all equivalent triggers are forced, so its policy loss is masked.
-
-## Audit and length invariants
-
-The frozen audit must satisfy:
+Group-aware subset target capacities/counts are present:
 
 ```text
-decision_count                 1,128,724
-unpaired_pending               0
-illegal_action_index           0
-deck_configuration_action      15,000
-duplicate_old_observation      1,143,724
-duplicate action index         0
-Ability detail log mapping     0 / 93,237 selected Ability actions
+TARGET CONTRACT IMPLEMENTED
+TRAINING LOSS NOT IMPLEMENTED
 ```
 
-Ability detail use therefore defaults to `UNKNOWN`; only a versioned rule
-resolver may emit `TRUE` or `FALSE` with an inference source.
+No training loss module is added in this revision.
 
-`effect` and `contextCard` are simultaneously non-null in 37,789 decisions, so
-neither can replace the other. `turnActionCount` is present and non-null in all
-1,128,724 selects; within the same engine turn it strictly increases in 946,757
-transitions, never stays equal or decreases, and 166,967 transitions cross a
-turn boundary. It is therefore stored directly with validity rather than
-reconstructed as a dataset-global decision position.
+Residual IPF remains an independent mathematical utility. Replay datasets do
+not run it by default. `hidden_belief_state=NOT_APPLICABLE` means disabled;
+`PRESENT` requires a real computation, and `UNKNOWN` is reserved for an enabled
+module with insufficient inputs. Expected zone counts are not presence
+probabilities or calibrated posteriors.
 
-Board batching keeps all visible instances. The observed conservative upper
-bound is 225 tokens (P99 about 213), with padding/relation masks and
-length-bucketed batches. If a later budget is needed, Events or recalled Card ID
-Memory are reduced before visible Card Instances.
+`used_detail` is inactive. Non-Pokémon/no-detail rows are `NOT_APPLICABLE`;
+unmapped Pokémon details are `UNKNOWN`. Only an explicit audited mapping may
+emit `TRUE`/`FALSE` with an inference source. No Ability mapping or auxiliary
+training target is claimed.

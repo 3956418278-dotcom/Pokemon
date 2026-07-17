@@ -52,7 +52,7 @@ class GameMemoryState:
         turn = parsed.global_snapshot.turn
         for event in self.recent_events:
             event.observation_age += 1
-            event.turn_delta = max(0, turn - event.observed_turn)
+            event.turn_age = max(0, turn - event.observed_at_turn)
         for player_index, counts in enumerate(parsed.global_snapshot.player_counts):
             self.public_counts_by_player[player_index] = dict(counts)
         # The batch logs describe transitions leading to the current snapshot.
@@ -129,19 +129,8 @@ class GameMemoryState:
                 counters[key] = counters.get(key, 0) + quantity
         memory = self._memory_for_event(event, turn)
         if memory is None:
-            if event.from_area is not None and event.player_index is not None:
-                possible_mask = 1 << int(event.from_area)
-                if event.to_area is not None:
-                    possible_mask |= 1 << int(event.to_area)
-                for candidate in self.serials.values():
-                    if (
-                        candidate.player_index == event.player_index
-                        and candidate.current_area == event.from_area
-                    ):
-                        candidate.previous_area = candidate.current_area
-                        candidate.current_area = None
-                        candidate.possible_hidden_zone_mask |= possible_mask
-                        candidate.last_event_type = event.event_type
+            # An anonymous movement only proves aggregate flow. It cannot identify
+            # which known serial moved, so exact serial locations remain untouched.
             return
         memory.last_event_type = event.event_type
         memory.last_seen_observation = self.observation_count
@@ -184,12 +173,11 @@ class GameMemoryState:
             relative = 0 if absolute_player == your_index else 1
             transitions[relative] = dict(counts)
         return AnonymousHiddenPoolsRecord(
-            self_unresolved_deck_prize_count=max(
-                0,
-                public(your_index, "deck")
-                + public(your_index, "prize")
-                - exact(your_index, 1)
-                - exact(your_index, 6),
+            self_unknown_deck_count=max(
+                0, public(your_index, "deck") - exact(your_index, 1)
+            ),
+            self_unknown_prize_count=max(
+                0, public(your_index, "prize") - exact(your_index, 6)
             ),
             opponent_unknown_hand_count=max(
                 0, public(opponent_index, "hand") - exact(opponent_index, 2)
@@ -200,22 +188,14 @@ class GameMemoryState:
             opponent_unknown_prize_count=max(
                 0, public(opponent_index, "prize") - exact(opponent_index, 6)
             ),
-            anonymous_zone_transitions_by_side=transitions,
+            cumulative_anonymous_zone_transitions_by_side=transitions,
         )
 
     def card_id_memory_records(
         self,
         your_index: int,
-        *,
-        expected_zone_counts: dict[tuple[int, int], dict[str, float]] | None = None,
-        presence_predictions: dict[tuple[int, int], float] | None = None,
-        uncertainty: dict[tuple[int, int], float] | None = None,
     ) -> list[CardIdMemoryRecord]:
         """Derive Card ID memory from the serial registry without mutable ledger state."""
-
-        expected_zone_counts = expected_zone_counts or {}
-        presence_predictions = presence_predictions or {}
-        uncertainty = uncertainty or {}
 
         area_names = {
             1: "DECK",
@@ -236,9 +216,8 @@ class GameMemoryState:
                 continue
             owner_relative = 0 if memory.player_index == your_index else 1
             grouped.setdefault((owner_relative, int(memory.card_id)), []).append(memory)
-        keys = set(grouped) | set(expected_zone_counts) | set(presence_predictions) | set(uncertainty)
         records = []
-        for owner_relative, card_id in sorted(keys):
+        for owner_relative, card_id in sorted(grouped):
             memories = grouped.get((owner_relative, card_id), [])
             exact_counts: dict[str, int] = {}
             for memory in memories:
@@ -249,23 +228,18 @@ class GameMemoryState:
                 CardIdMemoryRecord(
                     owner_relative=owner_relative,
                     card_id=card_id,
-                    exact_zone_counts=exact_counts,
-                    ambiguous_hidden_count=sum(
+                    currently_exact_zone_counts=exact_counts,
+                    ambiguous_serial_count=sum(
                         memory.current_area is None and memory.possible_hidden_zone_mask != 0
                         for memory in memories
                     ),
-                    expected_zone_counts=dict(
-                        expected_zone_counts.get((owner_relative, card_id), {})
-                    ),
-                    presence_prediction=presence_predictions.get((owner_relative, card_id)),
-                    uncertainty=uncertainty.get((owner_relative, card_id)),
-                    revealed_unique_copy_count=len(memories),
-                    historical_seen_count=sum(memory.seen_count for memory in memories),
-                    historical_move_count=sum(memory.moved_count for memory in memories),
-                    first_seen_turn=(
+                    known_serial_count=len(memories),
+                    visible_observation_count=sum(memory.seen_count for memory in memories),
+                    movement_event_count=sum(memory.moved_count for memory in memories),
+                    first_known_turn=(
                         min(memory.first_seen_turn for memory in memories) if memories else None
                     ),
-                    last_seen_turn=(
+                    last_known_turn=(
                         max(memory.last_seen_turn for memory in memories) if memories else None
                     ),
                 )
@@ -351,6 +325,9 @@ class GameMemoryState:
             features[12] = float(event.event_type in {16, 17, 18, 19, 20, 21})
             features[13] = float(event.event_type in {4, 5, 6, 7})
             features[14] = min(event.observation_age, 32) / 32.0
-            features[15] = min(event.event_position_in_batch, 32) / 32.0
+            features[15] = min(event.batch_position, 32) / 32.0
+            features[16] = min(event.turn_age, 32) / 32.0
+            features[17] = min(max(event.observed_at_turn, 0), 100) / 100.0
+            features[18] = min(max(event.observed_at_turn_action_count, 0), 32) / 32.0
             rows.append(features)
         return rows

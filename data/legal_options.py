@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
+from dataclasses import replace
 from typing import Any
 
 from .decision_schema import ActionSemantics, FieldState, LegalActionTarget
@@ -10,13 +11,20 @@ from .decision_schema import ActionSemantics, FieldState, LegalActionTarget
 
 INDEX_FIELDS = {"index", "inPlayIndex", "toolIndex", "energyIndex"}
 DIRECT_IDENTITY_FIELDS = {"cardId", "serial"}
+OPTION_NEGATIVE_ONE_SENTINEL_FIELDS = INDEX_FIELDS | DIRECT_IDENTITY_FIELDS | {
+    "type",
+    "area",
+    "inPlayArea",
+    "playerIndex",
+    "attackId",
+    "skillId",
+    "abilityId",
+    "detailId",
+    "specialConditionType",
+}
 AUDITED_UNORDERED_SELECT_CONTEXTS = frozenset(
     {
         (1, 2),   # setup: choose the remaining Basic Pokémon for the Bench
-        (1, 5),
-        (1, 7),
-        (1, 8),
-        (1, 9),
         (1, 15),  # Trifrost: three Pokémon receive the same simultaneous damage
         (1, 21),  # choose Pokémon receiving one equivalent Energy each
         (2, 26),  # discard an Energy subset; damage depends on count
@@ -24,6 +32,15 @@ AUDITED_UNORDERED_SELECT_CONTEXTS = frozenset(
         (5, 34),  # forced Risky Ruins trigger set
     }
 )
+
+CONTEXT_SEMANTIC_SOURCES: dict[tuple[int, int], str] = {
+    **{key: "RULE_CONFIRMED" for key in AUDITED_UNORDERED_SELECT_CONTEXTS},
+    (1, 5): "UNRESOLVED",
+    (1, 7): "UNRESOLVED",
+    (1, 8): "UNRESOLVED",
+    (1, 9): "UNRESOLVED",
+    (1, 22): "REPLAY_SUPPORTED",
+}
 
 
 def _int(value: Any, default: int = -1) -> int:
@@ -39,7 +56,7 @@ def _field_state(obj: Any, key: str) -> str:
     value = obj[key]
     if value is None:
         return FieldState.EXPLICIT_NULL.name
-    if isinstance(value, int) and value < 0:
+    if key in OPTION_NEGATIVE_ONE_SENTINEL_FIELDS and value == -1:
         return FieldState.UNKNOWN.name
     return FieldState.PRESENT.name
 
@@ -48,8 +65,10 @@ def _area_cards(observation: dict[str, Any], player_index: int, area: int) -> li
     current = observation.get("current") or {}
     players = current.get("players") or []
     player = players[player_index] if 0 <= player_index < len(players) else {}
+    select = observation.get("select") or {}
+    select_deck = select.get("deck") if "deck" in select else None
     return {
-        1: (observation.get("select") or {}).get("deck") or current.get("looking"),
+        1: select_deck,
         2: player.get("hand"),
         3: player.get("discard"),
         4: player.get("active"),
@@ -88,7 +107,7 @@ def _direct_card_reference(
             candidates.append((zone, owner, card))
     for card in select.get("deck") or []:
         owner = _int(card.get("playerIndex"), your_index) if isinstance(card, dict) else None
-        candidates.append((1, owner, card))
+        candidates.append((12, owner, card))
 
     def walk(card: Any, zone: int, owner: int | None) -> tuple[Any, int, int | None] | None:
         if not isinstance(card, dict):
@@ -104,23 +123,26 @@ def _direct_card_reference(
                     return found
         return None
 
+    matches: list[tuple[Any, int, int | None]] = []
     for zone, owner, card in candidates:
         found = walk(card, zone, owner)
         if found is not None:
-            return found
+            matches.append(found)
+    if len(matches) == 1:
+        return matches[0]
     return None, None, None
 
 
-def _without_serial(value: Any) -> Any:
+def _normalized_reference(value: Any) -> Any:
     if isinstance(value, list):
-        return [_without_serial(item) for item in value]
+        return [_normalized_reference(item) for item in value]
     if not isinstance(value, dict):
         return value
     result = {}
     for key, item in sorted(value.items()):
-        if key in {"serial", "name"}:
+        if key == "name" and value.get("id") is not None:
             continue
-        normalized = _without_serial(item)
+        normalized = _normalized_reference(item)
         if key in {"energies", "energyCards", "tools"} and isinstance(normalized, list):
             normalized = sorted(
                 normalized,
@@ -144,23 +166,32 @@ def option_equivalence_key(observation: dict[str, Any], option: dict[str, Any]) 
     source_zone = area if area >= 0 else (2 if option_type in {7, 8, 9} else None)
     source_owner = player_index
     target_owner = None
+    resolution_status = "FULLY_RESOLVED"
+    reference_expected = False
     if option_type == 7:
+        reference_expected = True
         source = _indexed(_area_cards(observation, your_index, 2), option.get("index"))
     elif option_type in {8, 9}:
+        reference_expected = True
         source = _indexed(_area_cards(observation, your_index, 2), option.get("index"))
         target = _indexed(
             _area_cards(observation, your_index, _int(option.get("inPlayArea"))),
             option.get("inPlayIndex"),
         )
     elif option_type in {3, 10, 11, 15}:
+        reference_expected = True
         source = _indexed(_area_cards(observation, player_index, area), option.get("index"))
     elif option_type in {4, 5}:
+        reference_expected = True
         parent = _indexed(_area_cards(observation, player_index, area), option.get("index"))
         child_key = "tools" if option_type == 4 else "energyCards"
         child_index = option.get("toolIndex") if option_type == 4 else option.get("energyIndex")
         source = _indexed(parent.get(child_key) if isinstance(parent, dict) else None, child_index)
         target = parent
         target_owner = player_index
+        source_zone = 9 if option_type == 4 else 8
+    if area == 1 and source is not None:
+        source_zone = 12
     if source is None and any(field in option for field in DIRECT_IDENTITY_FIELDS):
         direct, direct_zone, direct_owner = _direct_card_reference(observation, option)
         if direct is not None:
@@ -169,23 +200,42 @@ def option_equivalence_key(observation: dict[str, Any], option: dict[str, Any]) 
             source_owner = direct_owner
     if target is not None and target_owner is None:
         target_owner = your_index
+    if option_type in {8, 9}:
+        target_zone = _int(option.get("inPlayArea"), -1)
+    elif option_type in {4, 5} and target is not None:
+        target_zone = area
+    else:
+        target_zone = None
+    if reference_expected and source is None:
+        resolution_status = "UNRESOLVED"
+    elif option_type in {8, 9} and target is None:
+        resolution_status = "PARTIALLY_RESOLVED" if source is not None else "UNRESOLVED"
+    for decision_reference in (select.get("effect"), select.get("contextCard")):
+        if decision_reference is None:
+            continue
+        if not isinstance(decision_reference, dict):
+            resolution_status = "UNRESOLVED"
+            break
+        if any(decision_reference.get(key) is None for key in ("id", "serial", "playerIndex")):
+            if resolution_status == "FULLY_RESOLVED":
+                resolution_status = "PARTIALLY_RESOLVED"
 
     normalized = {
         "select_type": _int(select.get("type")),
         "select_context": _int(select.get("context")),
         "option_type": option_type,
         "source_zone": source_zone,
-        "target_zone": _int(option.get("inPlayArea"), -1),
-        "source_identity_and_dynamic_state": _without_serial(source),
-        "target_identity_and_dynamic_state": _without_serial(target),
+        "target_zone": target_zone,
+        "source_identity_and_dynamic_state": _normalized_reference(source),
+        "target_identity_and_dynamic_state": _normalized_reference(target),
         "detail_reference": {
             key: option.get(key)
             for key in ("attackId", "skillId", "abilityId", "detailId")
             if key in option
         },
-        "effect_reference": _without_serial(select.get("effect")),
+        "effect_reference": _normalized_reference(select.get("effect")),
         "effect_presence": _field_state(select, "effect"),
-        "context_card_reference": _without_serial(select.get("contextCard")),
+        "context_card_reference": _normalized_reference(select.get("contextCard")),
         "context_card_presence": _field_state(select, "contextCard"),
         "option_field_states": {
             key: _field_state(option, key)
@@ -219,6 +269,7 @@ def option_equivalence_key(observation: dict[str, Any], option: dict[str, Any]) 
         },
         "source_owner": source_owner,
         "target_owner": target_owner,
+        "equivalence_resolution_status": resolution_status,
     }
     if any(field in option for field in INDEX_FIELDS) and source is None and target is None:
         normalized["unresolved_indices"] = {
@@ -233,6 +284,13 @@ def option_equivalence_key(observation: dict[str, Any], option: dict[str, Any]) 
     return normalized
 
 
+def semantic_source_for_select(select: dict[str, Any]) -> str:
+    return CONTEXT_SEMANTIC_SOURCES.get(
+        (_int(select.get("type")), _int(select.get("context"))),
+        "IMPLEMENTATION_ASSUMPTION",
+    )
+
+
 def option_equivalence_signature(observation: dict[str, Any], option: dict[str, Any]) -> str:
     """Hash the formal key; unresolved references retain indices conservatively."""
 
@@ -244,8 +302,11 @@ def option_equivalence_signature(observation: dict[str, Any], option: dict[str, 
 def equivalence_class_ids(observation: dict[str, Any], options: list[dict[str, Any]]) -> list[int]:
     signature_to_class: dict[str, int] = {}
     result: list[int] = []
-    for option in options:
+    for index, option in enumerate(options):
+        key = option_equivalence_key(observation, option)
         signature = option_equivalence_signature(observation, option)
+        if key["equivalence_resolution_status"] != "FULLY_RESOLVED":
+            signature = f"unresolved:{index}:{signature}"
         if signature not in signature_to_class:
             signature_to_class[signature] = len(signature_to_class)
         result.append(signature_to_class[signature])
@@ -281,6 +342,16 @@ def build_action_target(
 ) -> LegalActionTarget:
     options = (observation.get("select") or {}).get("option") or []
     classes = equivalence_class_ids(observation, options)
+    statuses = [
+        option_equivalence_key(observation, option)["equivalence_resolution_status"]
+        for option in options
+    ]
+    if any(status == "UNRESOLVED" for status in statuses):
+        resolution_status = "UNRESOLVED"
+    elif any(status == "PARTIALLY_RESOLVED" for status in statuses):
+        resolution_status = "PARTIALLY_RESOLVED"
+    else:
+        resolution_status = "FULLY_RESOLVED"
     if any(index < 0 or index >= len(options) for index in action):
         raise ValueError("action contains an out-of-range legal option index")
     ordered_classes = tuple(classes[index] for index in action)
@@ -295,7 +366,7 @@ def build_action_target(
             if option.get("number") is not None:
                 count_mapping.setdefault(_int(option["number"]), []).append(index)
     capacities = Counter(classes)
-    return LegalActionTarget(
+    target = LegalActionTarget(
         semantics=semantics,
         chosen_option_indices=tuple(action),
         equivalence_class_ids=tuple(classes),
@@ -311,25 +382,37 @@ def build_action_target(
             if count_mapping is not None
             else None
         ),
+        equivalence_resolution_status=resolution_status,
     )
+    _mask, reason = policy_mask_decision(observation.get("select") or {}, target)
+    return replace(target, policy_mask_reason=reason)
 
 
-def policy_loss_mask(select: dict[str, Any], target: LegalActionTarget) -> bool:
-    """Whether the equivalence-aware action space contains a real choice."""
+def policy_mask_decision(select: dict[str, Any], target: LegalActionTarget) -> tuple[bool, str]:
+    """Return whether policy loss applies and the auditable reason."""
 
     minimum = _int(select.get("minCount"), 0)
     maximum = _int(select.get("maxCount"), 0)
     class_count = len(target.equivalence_class_capacities)
+    legal_option_count = sum(target.equivalence_class_capacities.values())
+    if legal_option_count <= 1:
+        return False, "SINGLE_LEGAL_OPTION"
     if target.semantics is ActionSemantics.COUNT_VALUE:
-        return len(target.count_value_to_option_indices or {}) > 1
+        if len(target.count_value_to_option_indices or {}) <= 1:
+            return False, "ONE_COUNT_VALUE"
+        return True, "REAL_POLICY_CHOICE"
+    if target.equivalence_resolution_status != "FULLY_RESOLVED":
+        return True, "UNRESOLVED_EQUIVALENCE"
     if target.semantics is ActionSemantics.SINGLE_INDEX:
-        return minimum == 0 or class_count > 1
+        if minimum == 0 or class_count > 1:
+            return True, "REAL_POLICY_CHOICE"
+        return False, "ONE_FEASIBLE_CLASS_TARGET"
     if minimum != maximum:
-        return True
+        return True, "REAL_POLICY_CHOICE"
     if minimum == 0:
-        return False
+        return False, "FORCED_FULL_SUBSET"
     if target.semantics is ActionSemantics.ORDERED_INDEX_SEQUENCE:
-        return class_count > 1
+        return True, "REAL_POLICY_CHOICE"
 
     # For a fixed-cardinality unordered target, count feasible class-count
     # vectors. Stop once two distinct targets are known to exist.
@@ -341,4 +424,11 @@ def policy_loss_mask(select: dict[str, Any], target: LegalActionTarget) -> bool:
                 total = subtotal + chosen
                 updated[total] = min(2, updated.get(total, 0) + ways)
         reachable = updated
-    return reachable.get(minimum, 0) > 1
+    if reachable.get(minimum, 0) > 1:
+        return True, "REAL_POLICY_CHOICE"
+    reason = "FORCED_FULL_SUBSET" if minimum == legal_option_count else "ONE_FEASIBLE_CLASS_TARGET"
+    return False, reason
+
+
+def policy_loss_mask(select: dict[str, Any], target: LegalActionTarget) -> bool:
+    return policy_mask_decision(select, target)[0]

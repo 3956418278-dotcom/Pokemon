@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -99,13 +100,32 @@ def normalize_statistics(
     min_card_count: int = 20,
     min_pair_count: int = 20,
     prior_strength: float = 100.0,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    dates: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     if min_card_count < 1 or min_pair_count < 1:
         raise ValueError("minimum support counts must be positive")
     if prior_strength <= 0:
         raise ValueError("prior_strength must be positive")
 
-    daily_dirs = discover_daily_statistics(input_dir)
+    all_daily_dirs = discover_daily_statistics(input_dir)
+    requested_dates = sorted(set(dates or []))
+    for value in [start_date, end_date, *requested_dates]:
+        if value is not None:
+            date.fromisoformat(value)
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+    daily_dirs = [
+        path
+        for path in all_daily_dirs
+        if (start_date is None or path.name >= start_date)
+        and (end_date is None or path.name <= end_date)
+        and (not requested_dates or path.name in requested_dates)
+    ]
+    if not daily_dirs:
+        raise ValueError("the requested training date window contains no complete statistics")
+    excluded_dates = [path.name for path in all_daily_dirs if path not in daily_dirs]
     total_decks = 0
     cards: dict[int, dict[str, Any]] = {}
     pairs: dict[tuple[int, int], dict[str, Any]] = {}
@@ -253,6 +273,13 @@ def normalize_statistics(
     result = {
         "source_statistics_directory": str(input_dir),
         "source_dates": [path.name for path in daily_dirs],
+        "requested_window": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "dates": requested_dates,
+        },
+        "included_dates": [path.name for path in daily_dirs],
+        "excluded_dates": excluded_dates,
         "source_date_count": len(daily_dirs),
         "total_valid_complete_decks": total_decks,
         "card_count": len(card_rows),
@@ -288,6 +315,15 @@ def main() -> None:
         default=Path("outputs/replay_extract/statistics"),
         help="Directory containing YYYY-MM-DD statistic partitions.",
     )
+    parser.add_argument("--start-date", help="First training date to include (YYYY-MM-DD).")
+    parser.add_argument("--end-date", help="Last training date to include (YYYY-MM-DD).")
+    parser.add_argument(
+        "--date",
+        dest="dates",
+        action="append",
+        default=[],
+        help="Exact training date to include; repeat for multiple dates.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -308,6 +344,9 @@ def main() -> None:
         min_card_count=args.min_card_count,
         min_pair_count=args.min_pair_count,
         prior_strength=args.prior_strength,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        dates=args.dates,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 

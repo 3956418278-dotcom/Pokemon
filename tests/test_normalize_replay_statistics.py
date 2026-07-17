@@ -132,3 +132,25 @@ def test_normalization_rejects_pair_count_above_marginal(tmp_path: Path) -> None
         assert "occurs more often" in str(error)
     else:
         raise AssertionError("invalid pair marginal was accepted")
+
+
+def test_normalization_excludes_reserved_dates_from_training_window(tmp_path: Path) -> None:
+    source = tmp_path / "statistics"
+    _write_partition(source, "2026-07-01", 10, [(1, "one", 5, 5)], [])
+    _write_partition(source, "2026-07-10", 20, [(1, "one", 20, 20)], [])
+    summary = normalize_statistics(
+        source,
+        tmp_path / "out",
+        min_card_count=1,
+        min_pair_count=1,
+        start_date="2026-07-01",
+        end_date="2026-07-05",
+    )
+    assert summary["requested_window"] == {
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-05",
+        "dates": [],
+    }
+    assert summary["included_dates"] == ["2026-07-01"]
+    assert summary["excluded_dates"] == ["2026-07-10"]
+    assert summary["total_valid_complete_decks"] == 10

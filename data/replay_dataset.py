@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import json
 import re
+import zipfile
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -27,16 +28,24 @@ from .decision_schema import (
     TrainingTargetsRecord,
     TurnUsageRecord,
 )
-from .legal_options import build_action_target, infer_action_semantics, policy_loss_mask
+from .legal_options import (
+    build_action_target,
+    infer_action_semantics,
+    policy_mask_decision,
+)
 from .observation_parser import parse_observation
 from .state_schema import ParsedObservation
 
 
 REPLAY_DATE_PATTERN = re.compile(r"(20\d{2}-\d{2}-\d{2})")
+DECISION_SCHEMA_VERSION = "replay_decision_contract_v2"
+REFERENCE_SCHEMA_VERSION = "replay_decision_reference_v2"
+PARSER_CONTRACT_VERSION = "replay_observation_parser_v2"
 
 
 @dataclass
 class ReplayDecisionSample:
+    replay_key: str
     replay_id: str | None
     episode_id: int | None
     step_index: int
@@ -54,6 +63,10 @@ class ReplayDecisionSample:
     select_context: int
     done: bool = False
     source_path: str | None = None
+    source_kind: str = "JSON_FILE"
+    source_record_line: int | None = None
+    source_archive_member: str | None = None
+    source_content_hash: str | None = None
     source_date: str | None = None
     action_step_index: int | None = None
     observation_fingerprint: str | None = None
@@ -62,13 +75,7 @@ class ReplayDecisionSample:
 
     @property
     def episode_key(self) -> str | None:
-        if self.episode_id is not None:
-            return f"episode:{self.episode_id}"
-        if self.replay_id is not None:
-            return f"replay:{self.replay_id}"
-        if self.source_path is not None:
-            return f"path:{self.source_path}"
-        return None
+        return self.replay_key
 
     @property
     def decision_step_index(self) -> int:
@@ -79,6 +86,7 @@ class ReplayDecisionSample:
         if self.action_step_index is None:
             raise ValueError("a finalized decision must have an action_step_index")
         return DecisionKey(
+            replay_key=self.replay_key,
             episode_id=self.episode_id,
             decision_step_index=self.decision_step_index,
             action_step_index=self.action_step_index,
@@ -115,12 +123,29 @@ def _int(value: Any, default: int | None = -1) -> int | None:
         return default
 
 
-def _action_list(value: Any) -> list[int]:
+class ActionAlignmentError(ValueError):
+    pass
+
+
+def _action_index(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ActionAlignmentError("boolean action index is invalid")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    raise ActionAlignmentError(f"invalid action index {value!r}")
+
+
+def parse_action(value: Any) -> list[int]:
     if value is None:
         return []
     if isinstance(value, list):
-        return [int(_int(item, 0) or 0) for item in value]
-    return [int(_int(value, 0) or 0)]
+        return [_action_index(item) for item in value]
+    return [_action_index(value)]
+
+
+_action_list = parse_action
 
 
 def _option_type(option: dict[str, Any]) -> int:
@@ -138,6 +163,35 @@ def observation_fingerprint(observation: dict[str, Any]) -> str:
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def replay_content_hash(replay: dict[str, Any]) -> str:
+    encoded = json.dumps(replay, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _normalized_source_path(path: Path) -> str:
+    return path.resolve().as_posix()
+
+
+def stable_replay_key(
+    replay: dict[str, Any],
+    replay_path: Path,
+    record_line: int | None = None,
+    archive_member: str | None = None,
+) -> str:
+    info = replay.get("info")
+    episode_id = info.get("EpisodeId") if isinstance(info, dict) else None
+    if episode_id is not None:
+        return f"episode:{episode_id}"
+    if replay.get("id") is not None:
+        return f"replay:{replay['id']}"
+    if archive_member is not None:
+        return f"archive:{archive_member}"
+    path = _normalized_source_path(replay_path)
+    if record_line is not None:
+        return f"jsonl:{path}#L{record_line}"
+    return f"path:{path}"
 
 
 @dataclass
@@ -186,12 +240,10 @@ class ReplayDecisionDataset:
     def __init__(
         self,
         replay_paths: list[Path],
-        include_no_select: bool = False,
         controlled_agents: set[int] | None = None,
         max_samples: int | None = None,
     ) -> None:
         self.replay_paths = replay_paths
-        self.include_no_select = include_no_select
         self.controlled_agents = controlled_agents
         self.samples: list[ReplayDecisionSample] = []
         self.summary = ReplayDatasetSummary()
@@ -201,14 +253,12 @@ class ReplayDecisionDataset:
     def from_paths(
         cls,
         paths: Iterable[str | Path],
-        include_no_select: bool = False,
         controlled_agents: set[int] | None = None,
         max_samples: int | None = None,
     ) -> "ReplayDecisionDataset":
         replay_paths = iter_replay_paths([Path(path) for path in paths])
         return cls(
             replay_paths,
-            include_no_select=include_no_select,
             controlled_agents=controlled_agents,
             max_samples=max_samples,
         )
@@ -222,29 +272,44 @@ class ReplayDecisionDataset:
     def _load(self, max_samples: int | None) -> None:
         for replay_path in self.replay_paths:
             if replay_path.suffix.lower() == ".jsonl":
-                for replay in self._load_jsonl(replay_path):
-                    self._append_replay(replay, replay_path, max_samples)
+                for replay, line_number, content_hash in self._load_jsonl(replay_path):
+                    self._append_replay(
+                        replay,
+                        replay_path,
+                        max_samples,
+                        source_record_line=line_number,
+                        source_content_hash=content_hash,
+                    )
                     if max_samples is not None and len(self.samples) >= max_samples:
                         return
             else:
                 try:
-                    replay = json.loads(replay_path.read_text(encoding="utf-8"))
+                    raw_replay = replay_path.read_bytes()
+                    replay = json.loads(raw_replay)
                 except (OSError, json.JSONDecodeError) as exc:
                     self._record_error(replay_path, f"{type(exc).__name__}: {exc}", stage="replay_load")
                     continue
-                self._append_replay(replay, replay_path, max_samples)
+                self._append_replay(
+                    replay,
+                    replay_path,
+                    max_samples,
+                    source_content_hash=hashlib.sha256(raw_replay).hexdigest(),
+                )
                 if max_samples is not None and len(self.samples) >= max_samples:
                     return
         self.summary.sample_count = len(self.samples)
 
-    def _load_jsonl(self, replay_path: Path) -> Iterable[dict[str, Any]]:
+    def _load_jsonl(
+        self, replay_path: Path
+    ) -> Iterable[tuple[dict[str, Any], int, str]]:
         try:
-            handle = replay_path.open("r", encoding="utf-8")
+            handle = replay_path.open("rb")
         except OSError as exc:
             self._record_error(replay_path, f"{type(exc).__name__}: {exc}", stage="replay_load")
             return
         with handle:
-            for line_number, line in enumerate(handle, start=1):
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.decode("utf-8")
                 if line.strip():
                     try:
                         replay = json.loads(line)
@@ -256,7 +321,7 @@ class ReplayDecisionDataset:
                             line=line_number,
                         )
                         continue
-                    yield replay
+                    yield replay, line_number, hashlib.sha256(raw_line).hexdigest()
 
     def _record_error(
         self,
@@ -277,7 +342,17 @@ class ReplayDecisionDataset:
             row["line"] = line
         self.summary.parser_errors.append(row)
 
-    def _append_replay(self, replay: dict[str, Any], replay_path: Path, max_samples: int | None) -> None:
+    def _append_replay(
+        self,
+        replay: dict[str, Any],
+        replay_path: Path,
+        max_samples: int | None,
+        *,
+        source_record_line: int | None = None,
+        source_archive_member: str | None = None,
+        source_content_hash: str | None = None,
+        replay_key_override: str | None = None,
+    ) -> None:
         if not isinstance(replay, dict) or not isinstance(replay.get("steps"), list):
             self._record_error(
                 replay_path,
@@ -293,6 +368,19 @@ class ReplayDecisionDataset:
         info = replay.get("info")
         episode_id = info.get("EpisodeId") if isinstance(info, dict) else None
         source_date = replay_source_date(replay_path)
+        replay_key = replay_key_override or stable_replay_key(
+            replay, replay_path, source_record_line, source_archive_member
+        )
+        if not replay_key:
+            raise ValueError("stable replay identity must be non-empty")
+        content_hash = source_content_hash or replay_content_hash(replay)
+        source_kind = (
+            "ZIP_MEMBER"
+            if source_archive_member is not None
+            else "JSONL_RECORD"
+            if source_record_line is not None
+            else "JSON_FILE"
+        )
         for step_index, step in enumerate(replay.get("steps", []) or []):
             if not isinstance(step, list):
                 self._record_error(
@@ -314,9 +402,21 @@ class ReplayDecisionDataset:
                         agent=agent_index,
                     )
                     continue
-                action = _action_list(agent_step.get("action"))
+                try:
+                    action = _action_list(agent_step.get("action"))
+                except ActionAlignmentError as exc:
+                    action = None
+                    self.summary.illegal_action_indices += 1
+                    self._record_error(
+                        replay_path,
+                        f"ActionAlignmentError: {exc}",
+                        stage="action_alignment",
+                        step=step_index,
+                        agent=agent_index,
+                        line=source_record_line,
+                    )
                 previous = pending.pop(agent_index, None)
-                if previous is not None:
+                if previous is not None and action is not None:
                     option_types = [_option_type(option) for option in previous.parsed.select_options]
                     select = previous.observation.get("select") or {}
                     action_semantics = infer_action_semantics(select, action)
@@ -358,6 +458,7 @@ class ReplayDecisionDataset:
                         )
                         self.samples.append(
                             ReplayDecisionSample(
+                            replay_key=replay_key,
                             replay_id=str(replay_id) if replay_id is not None else None,
                             episode_id=_int(episode_id, None),
                             step_index=previous.decision_step_index,
@@ -376,6 +477,10 @@ class ReplayDecisionDataset:
                             select_context=previous.parsed.global_snapshot.select_context,
                             done=str(agent_step.get("status", "")).upper() == "DONE",
                             source_path=str(replay_path),
+                            source_kind=source_kind,
+                            source_record_line=source_record_line,
+                            source_archive_member=source_archive_member,
+                            source_content_hash=content_hash,
                             source_date=source_date,
                             observation_fingerprint=previous.fingerprint,
                             action_semantics=action_semantics,
@@ -386,7 +491,11 @@ class ReplayDecisionDataset:
                         if max_samples is not None and len(self.samples) >= max_samples:
                             self.summary.sample_count = len(self.samples)
                             return
-                elif len(action) == 60:
+                elif previous is not None:
+                    # Invalid action payload: the pending state is consumed but no
+                    # behavior-cloning label is fabricated.
+                    pass
+                elif action is not None and len(action) == 60:
                     # The initial deck submission is configuration, not behavior cloning.
                     self.summary.deck_configuration_actions += 1
                 elif action:
@@ -446,6 +555,7 @@ class ReplayDecisionDataset:
                 {
                     "index": index,
                     "replay_id": sample.replay_id,
+                    "replay_key": sample.replay_key,
                     "episode_id": sample.episode_id,
                     "episode_key": sample.episode_key,
                     "source_path": sample.source_path,
@@ -481,6 +591,7 @@ def collate_replay_decisions(samples: list[ReplayDecisionSample]) -> dict[str, A
         "metadata": [
             {
                 "replay_id": sample.replay_id,
+                "replay_key": sample.replay_key,
                 "episode_id": sample.episode_id,
                 "episode_key": sample.episode_key,
                 "source_path": sample.source_path,
@@ -519,12 +630,23 @@ def replay_decision_reference_dict(
     if final_reward is not None:
         outcome = 1 if final_reward > 0 else -1 if final_reward < 0 else 0
     select = sample.observation.get("select") or {}
+    mask, mask_reason = (
+        policy_mask_decision(select, sample.action_target)
+        if sample.action_target is not None
+        else (False, "UNRESOLVED_EQUIVALENCE")
+    )
     return {
-        "schema_version": "replay_decision_reference_v1",
+        "schema_version": REFERENCE_SCHEMA_VERSION,
+        "parser_contract_version": PARSER_CONTRACT_VERSION,
+        "decision_schema_version": DECISION_SCHEMA_VERSION,
         "decision_key": asdict(sample.decision_key),
         "source": {
+            "source_kind": sample.source_kind,
             "replay_path": sample.source_path,
+            "archive_member": sample.source_archive_member,
+            "replay_record_line": sample.source_record_line,
             "replay_id": sample.replay_id,
+            "content_hash": sample.source_content_hash,
         },
         "observation_fingerprint": sample.observation_fingerprint,
         "select_type": sample.select_type,
@@ -541,11 +663,8 @@ def replay_decision_reference_dict(
         "action": sample.action,
         "action_semantics": sample.action_semantics.value,
         "action_target": asdict(sample.action_target) if sample.action_target is not None else None,
-        "policy_loss_mask": (
-            policy_loss_mask(select, sample.action_target)
-            if sample.action_target is not None
-            else False
-        ),
+        "policy_loss_mask": mask,
+        "policy_mask_reason": mask_reason,
         "reward": sample.reward,
         "status": sample.status,
         "final_outcome": outcome,
@@ -556,16 +675,32 @@ def _snapshot_state_name(sample: ReplayDecisionSample, name: str) -> str:
     return sample.parsed.global_snapshot.field_states.get(name, FieldState.MISSING).name
 
 
-def _optional(value: Any, state: FieldState, placeholder: Any = 0) -> OptionalField:
-    return OptionalField(value=value if state is FieldState.PRESENT else placeholder, state=state)
+def _optional(
+    value: Any,
+    state: FieldState,
+    placeholder: Any = 0,
+    inference_source: str | None = None,
+) -> OptionalField:
+    return OptionalField(
+        value=value if state is FieldState.PRESENT else placeholder,
+        state=state,
+        inference_source=inference_source,
+    )
 
 
-def _combined_state(*states: FieldState) -> FieldState:
+def _required_inputs_state(*states: FieldState) -> FieldState:
+    """State for a derivation that requires every listed input.
+
+    A missing required input makes the derivation missing even when another
+    input is present or null. This is a validity rule, not a generic ranking for
+    arbitrary optional fields.
+    """
+
     if all(state is FieldState.PRESENT for state in states):
         return FieldState.PRESENT
     for state in (
-        FieldState.EXPLICIT_NULL,
         FieldState.MISSING,
+        FieldState.EXPLICIT_NULL,
         FieldState.UNKNOWN,
         FieldState.NOT_APPLICABLE,
     ):
@@ -579,6 +714,7 @@ def build_replay_decision_contract(
     *,
     final_outcome: int | None = None,
     hidden_belief: Any | None = None,
+    hidden_belief_enabled: bool = False,
 ) -> ReplayDecisionContract:
     """Materialize the frozen eight-class view without persisting a second copy."""
 
@@ -599,7 +735,9 @@ def build_replay_decision_contract(
         )
         player = players[absolute_index] if 0 <= absolute_index < len(players) else {}
         prefix = f"players[{absolute_index}]"
-        bench_state = _combined_state(state(f"{prefix}.benchMax"), state(f"{prefix}.bench"))
+        bench_state = _required_inputs_state(
+            state(f"{prefix}.benchMax"), state(f"{prefix}.bench")
+        )
         bench_free = 0
         if bench_state is FieldState.PRESENT:
             bench_free = int(player.get("benchMax")) - len(player.get("bench") or [])
@@ -614,13 +752,37 @@ def build_replay_decision_contract(
     first_state = state("firstPlayer")
     first_player = snapshot.first_player
     starting = first_player == sample.agent_index if first_state is FieldState.PRESENT else False
+    explicit_owner = None
+    explicit_source = None
+    for owner_field in ("turnOwner", "turnPlayer", "currentPlayerIndex"):
+        if owner_field in current and current[owner_field] is not None:
+            parsed_owner = _int(current[owner_field], None)
+            if parsed_owner in (0, 1):
+                explicit_owner = int(parsed_owner)
+                explicit_source = "EXPLICIT_ENGINE_FIELD"
+                break
+    turn_owner = explicit_owner
+    turn_owner_state = FieldState.PRESENT if explicit_owner is not None else FieldState.UNKNOWN
+    turn_owner_source = explicit_source
+    if (
+        turn_owner is None
+        and first_state is FieldState.PRESENT
+        and first_player in (0, 1)
+        and state("turn") is FieldState.PRESENT
+        and snapshot.turn >= 1
+        and len(players) == 2
+    ):
+        turn_owner = first_player if snapshot.turn % 2 == 1 else 1 - first_player
+        turn_owner_state = FieldState.PRESENT
+        turn_owner_source = "INFERRED_AUDITED_TURN_RULE"
+    is_owner = turn_owner == sample.agent_index if turn_owner is not None else False
     match = MatchContextRecord(
         turn=_optional(snapshot.turn, state("turn")),
         turn_action_count=_optional(snapshot.turn_action_count, state("turnActionCount")),
         is_starting_player=_optional(starting, first_state, False),
-        # The observation has no explicit turn-owner field. Do not infer it from
-        # parity until that engine rule is version-audited.
-        is_turn_owner=_optional(False, FieldState.UNKNOWN, False),
+        is_turn_owner=_optional(
+            is_owner, turn_owner_state, False, turn_owner_source
+        ),
     )
     opponent_index = 1 - your_index if your_index in (0, 1) else -1
     resources = ResourceContextRecord(
@@ -631,7 +793,12 @@ def build_replay_decision_contract(
             supporter_played=_optional(snapshot.supporter_played, state("supporterPlayed"), False),
             stadium_played=_optional(snapshot.stadium_played, state("stadiumPlayed"), False),
             retreated=_optional(snapshot.retreated, state("retreated"), False),
-            turn_owner_relative=_optional(0, FieldState.UNKNOWN),
+            turn_owner_relative=_optional(
+                (0 if turn_owner == your_index else 1) if turn_owner is not None else 0,
+                turn_owner_state,
+                0,
+                turn_owner_source,
+            ),
         ),
     )
     serial_registry = tuple(
@@ -700,25 +867,18 @@ def build_replay_decision_contract(
     )
     if sample.action_target is None:
         raise ValueError("a replay decision contract requires a valid legal action target")
+    mask, mask_reason = policy_mask_decision(
+        sample.observation.get("select") or {}, sample.action_target
+    )
     targets = TrainingTargetsRecord(
         legal_action=sample.action_target,
         final_outcome=final_outcome,
         hidden_truth_reference=sample.source_path,
-        policy_loss_mask=policy_loss_mask(sample.observation.get("select") or {}, sample.action_target),
+        policy_loss_mask=mask,
+        policy_mask_reason=mask_reason,
     )
     card_id_memory = tuple(
-        sample.memory_after.card_id_memory_records(
-            your_index,
-            expected_zone_counts=(
-                hidden_belief.expected_zone_counts if hidden_belief is not None else None
-            ),
-            presence_predictions=(
-                hidden_belief.presence_predictions if hidden_belief is not None else None
-            ),
-            uncertainty=(
-                hidden_belief.unresolved_zone_entropy if hidden_belief is not None else None
-            ),
-        )
+        sample.memory_after.card_id_memory_records(your_index)
     )
     memory_index = {
         (record.owner_relative, record.card_id): index
@@ -732,7 +892,7 @@ def build_replay_decision_contract(
         and (instance.relative_player, int(instance.card_id)) in memory_index
     )
     return ReplayDecisionContract(
-        schema_version="replay_decision_contract_v1",
+        schema_version=DECISION_SCHEMA_VERSION,
         key=sample.decision_key,
         match=match,
         resources=resources,
@@ -744,7 +904,11 @@ def build_replay_decision_contract(
         instance_card_id_memory_edges=instance_memory_edges,
         hidden_belief=hidden_belief,
         hidden_belief_state=(
-            FieldState.PRESENT if hidden_belief is not None else FieldState.NOT_APPLICABLE
+            FieldState.PRESENT
+            if hidden_belief is not None
+            else FieldState.UNKNOWN
+            if hidden_belief_enabled
+            else FieldState.NOT_APPLICABLE
         ),
         decision=decision,
         legal_options=tuple(sample.parsed.select_options),
@@ -752,19 +916,80 @@ def build_replay_decision_contract(
     )
 
 
-def _iter_replay_payloads(path: Path) -> Iterator[tuple[dict[str, Any], int | None]]:
+def _iter_replay_payloads(
+    path: Path,
+) -> Iterator[tuple[dict[str, Any], int | None, str]]:
     if path.suffix.lower() == ".jsonl":
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
+        with path.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.decode("utf-8")
                 if line.strip():
-                    yield json.loads(line), line_number
+                    yield json.loads(line), line_number, hashlib.sha256(raw_line).hexdigest()
     else:
-        yield json.loads(path.read_text(encoding="utf-8")), None
+        raw = path.read_bytes()
+        yield json.loads(raw), None, hashlib.sha256(raw).hexdigest()
+
+
+def rebuild_replay_decision_from_reference(
+    reference: dict[str, Any], *, source_path: str | Path | None = None
+) -> ReplayDecisionSample:
+    """Rebuild one compact row and fail closed on provenance/version drift."""
+
+    if reference.get("schema_version") != REFERENCE_SCHEMA_VERSION:
+        raise ValueError("decision reference schema version mismatch")
+    if reference.get("parser_contract_version") != PARSER_CONTRACT_VERSION:
+        raise ValueError("parser contract version mismatch")
+    if reference.get("decision_schema_version") != DECISION_SCHEMA_VERSION:
+        raise ValueError("decision contract schema version mismatch")
+    source = reference.get("source") or {}
+    raw_path = source_path or source.get("replay_path")
+    if not raw_path:
+        raise ValueError("decision reference has no replay source path")
+    resolved_path = Path(raw_path)
+    expected_line = source.get("replay_record_line")
+    archive_member = source.get("archive_member")
+    payload = None
+    raw_hash = None
+    if source.get("source_kind") == "ZIP_MEMBER":
+        if not archive_member:
+            raise ValueError("ZIP decision reference has no archive member")
+        with zipfile.ZipFile(resolved_path) as archive:
+            raw = archive.read(archive_member)
+        raw_hash = hashlib.sha256(raw).hexdigest()
+        payload = json.loads(raw)
+    else:
+        for replay, line_number, source_hash in _iter_replay_payloads(resolved_path):
+            if line_number == expected_line:
+                payload = replay
+                raw_hash = source_hash
+                break
+    if payload is None:
+        raise ValueError("referenced replay record was not found")
+    actual_hash = raw_hash or replay_content_hash(payload)
+    if actual_hash != source.get("content_hash"):
+        raise ValueError("replay source content hash mismatch")
+    dataset = ReplayDecisionDataset([])
+    dataset._append_replay(
+        payload,
+        resolved_path,
+        None,
+        source_record_line=expected_line,
+        source_archive_member=archive_member,
+        source_content_hash=actual_hash,
+        replay_key_override=(reference.get("decision_key") or {}).get("replay_key"),
+    )
+    expected_key = reference.get("decision_key")
+    for sample in dataset.samples:
+        if asdict(sample.decision_key) != expected_key:
+            continue
+        if sample.observation_fingerprint != reference.get("observation_fingerprint"):
+            raise ValueError("observation fingerprint mismatch")
+        return sample
+    raise ValueError("decision key was not found in the referenced replay")
 
 
 def iter_replay_decision_samples(
     paths: Iterable[str | Path],
-    include_no_select: bool = False,
     controlled_agents: set[int] | None = None,
     max_samples: int | None = None,
 ) -> Iterator[ReplayDecisionSample]:
@@ -773,15 +998,20 @@ def iter_replay_decision_samples(
     for replay_path in iter_replay_paths([Path(path) for path in paths]):
         try:
             payloads = _iter_replay_payloads(replay_path)
-            for replay, _line in payloads:
+            for replay, line_number, content_hash in payloads:
                 remaining = None if max_samples is None else max_samples - emitted
                 if remaining is not None and remaining <= 0:
                     return
                 dataset = ReplayDecisionDataset(
-                    [], include_no_select=include_no_select,
-                    controlled_agents=controlled_agents,
+                    [], controlled_agents=controlled_agents,
                 )
-                dataset._append_replay(replay, replay_path, remaining)
+                dataset._append_replay(
+                    replay,
+                    replay_path,
+                    remaining,
+                    source_record_line=line_number,
+                    source_content_hash=content_hash,
+                )
                 for sample in dataset.samples:
                     yield sample
                     emitted += 1
@@ -807,7 +1037,6 @@ def _distribution(values: list[int]) -> dict[str, Any]:
 def export_replay_decisions(
     paths: Iterable[str | Path],
     output_dir: Path,
-    include_no_select: bool = False,
     controlled_agents: set[int] | None = None,
     max_samples: int | None = None,
 ) -> dict[str, Any]:
@@ -844,18 +1073,23 @@ def export_replay_decisions(
         for replay_path in replay_paths:
             try:
                 payloads = _iter_replay_payloads(replay_path)
-                for replay, line_number in payloads:
+                for replay, line_number, content_hash in payloads:
                     summary["replay_count"] += 1
                     steps = replay.get("steps") if isinstance(replay, dict) else None
                     if not isinstance(steps, list):
                         raise ValueError("replay must contain a steps list")
                     step_counts.append(len(steps))
                     dataset = ReplayDecisionDataset(
-                        [], include_no_select=include_no_select,
-                        controlled_agents=controlled_agents,
+                        [], controlled_agents=controlled_agents,
                     )
                     remaining = None if max_samples is None else max_samples - summary["decision_sample_count"]
-                    dataset._append_replay(replay, replay_path, remaining)
+                    dataset._append_replay(
+                        replay,
+                        replay_path,
+                        remaining,
+                        source_record_line=line_number,
+                        source_content_hash=content_hash,
+                    )
                     if dataset.summary.replay_count == 0:
                         message = dataset.summary.parser_errors[-1]["error"] if dataset.summary.parser_errors else "invalid replay"
                         raise ValueError(message)
@@ -879,7 +1113,6 @@ def export_replay_decisions(
                     for sample in dataset.samples:
                         try:
                             payload = replay_decision_reference_dict(sample, final_rewards)
-                            payload["source"]["replay_record_line"] = line_number
                             reference_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                         except (TypeError, ValueError, OSError) as exc:
                             summary["output_serialization_error_count"] += 1
@@ -914,7 +1147,7 @@ def export_replay_decisions(
     summary["steps_per_replay"] = _distribution(step_counts)
     summary["decisions_per_replay"] = _distribution(decision_counts)
     audit = {
-        "schema_version": "replay_decision_reference_export_v1",
+        "schema_version": "replay_decision_reference_export_v2",
         "storage_contract": "Replay state is referenced by decision key and is not copied.",
         "decision_reference_file": str(reference_path.relative_to(output_dir)),
         **summary,

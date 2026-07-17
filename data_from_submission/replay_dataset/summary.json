@@ -1,0 +1,15 @@
+{
+  "replay_paths": [
+    "data_from_submission/replays/episode-84817357-replay.json"
+  ],
+  "replay_count": 1,
+  "sample_count": 20,
+  "skipped_no_select": 4,
+  "parser_errors": [],
+  "max_instances": 23,
+  "max_options": 12,
+  "max_events": 49,
+  "max_token_estimate": 44,
+  "include_no_select": false,
+  "controlled_agents": null
+}

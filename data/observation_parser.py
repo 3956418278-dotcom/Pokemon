@@ -24,7 +24,13 @@ def _has_field(obj: Any, name: str) -> bool:
     return hasattr(obj, name)
 
 
-def _field_state(obj: Any, name: str, *, applicable: bool = True) -> FieldState:
+def _field_state(
+    obj: Any,
+    name: str,
+    *,
+    applicable: bool = True,
+    unknown_sentinels: frozenset[Any] = frozenset(),
+) -> FieldState:
     if not applicable:
         return FieldState.NOT_APPLICABLE
     if not _has_field(obj, name):
@@ -32,9 +38,37 @@ def _field_state(obj: Any, name: str, *, applicable: bool = True) -> FieldState:
     value = _value(obj, name)
     if value is None:
         return FieldState.EXPLICIT_NULL
-    if isinstance(value, int) and value < 0:
+    if unknown_sentinels and any(value == sentinel for sentinel in unknown_sentinels):
         return FieldState.UNKNOWN
     return FieldState.PRESENT
+
+
+def _option_field_state(option: Any, name: str) -> FieldState:
+    negative_one_sentinel_fields = {
+        "type",
+        "area",
+        "index",
+        "playerIndex",
+        "toolIndex",
+        "energyIndex",
+        "inPlayArea",
+        "inPlayIndex",
+        "attackId",
+        "cardId",
+        "serial",
+        "specialConditionType",
+    }
+    return _field_state(
+        option,
+        name,
+        unknown_sentinels=(
+            frozenset({-1}) if name in negative_one_sentinel_fields else frozenset()
+        ),
+    )
+
+
+def _identity_field_state(obj: Any, name: str) -> FieldState:
+    return _field_state(obj, name, unknown_sentinels=frozenset({-1}))
 
 
 def _int(value: Any, default: int | None = 0) -> int | None:
@@ -78,7 +112,7 @@ def _card_instance(card: Any, area: int, zone: str, slot: int, your_index: int, 
         copy_count=1 if card_id is not None else None,
         source=source,
         field_states={
-            name: _field_state(card, name)
+            name: _identity_field_state(card, name)
             for name in ("id", "serial", "playerIndex")
         },
     )
@@ -176,7 +210,11 @@ def _pokemon_instance(
         special_conditions_valid=conditions_valid,
         copy_count=1 if card_id is not None else None,
         field_states={
-            name: _field_state(pokemon, name)
+            name: (
+                _identity_field_state(pokemon, name)
+                if name in {"id", "serial", "playerIndex"}
+                else _field_state(pokemon, name)
+            )
             for name in (
                 "id",
                 "serial",
@@ -249,10 +287,12 @@ def parse_global_snapshot(observation: Any) -> GlobalSnapshot:
     )
     if state is None:
         return GlobalSnapshot(field_states=field_states)
-    if _int(_value(state, "firstPlayer"), -1) == -1:
-        field_states["firstPlayer"] = FieldState.UNKNOWN
-    if _int(_value(state, "result"), -1) == -1:
-        field_states["result"] = FieldState.UNKNOWN
+    field_states["firstPlayer"] = _field_state(
+        state, "firstPlayer", unknown_sentinels=frozenset({-1})
+    )
+    field_states["result"] = _field_state(
+        state, "result", unknown_sentinels=frozenset({-1})
+    )
     your_index = _int(_value(state, "yourIndex"), 0) or 0
     players = _value(state, "players", []) or []
     player_counts = []
@@ -408,11 +448,31 @@ def parse_events(observation: Any) -> list[GameEvent]:
                 coin_result=_int(_value(log, "coinResult"), None),
                 is_reverse=event_type in {5, 7},
                 identity_visible=card_id is not None,
-                event_position_in_batch=event_position,
-                observed_turn=turn,
-                position_in_turn=turn_action_count,
+                batch_position=event_position,
+                observed_at_turn=turn,
+                observed_at_turn_action_count=turn_action_count,
                 field_states={
-                    canonical: _field_state(log, raw_name)
+                    canonical: _field_state(
+                        log,
+                        raw_name,
+                        unknown_sentinels=(
+                            frozenset({-1})
+                            if canonical
+                            in {
+                                "event_type",
+                                "player_index",
+                                "card_id",
+                                "serial",
+                                "from_area",
+                                "to_area",
+                                "target_card_id",
+                                "target_serial",
+                                "attack_id",
+                                "coin_result",
+                            }
+                            else frozenset()
+                        ),
+                    )
                     for canonical, raw_name in (
                         ("event_type", "type"),
                         ("player_index", "playerIndex"),
@@ -455,7 +515,7 @@ def parse_observation(observation: Any) -> ParsedObservation:
         context_card_presence=_field_state(select, "contextCard", applicable=select is not None),
         option_field_states=[
             {
-                name: _field_state(option, name)
+                name: _option_field_state(option, name)
                 for name in (
                     "type",
                     "number",

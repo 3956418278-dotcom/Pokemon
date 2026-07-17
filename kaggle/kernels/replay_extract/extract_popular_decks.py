@@ -94,14 +94,18 @@ def first_present_column(df: pd.DataFrame, names: list[str]) -> str | None:
     return None
 
 
-def find_card_data_csv() -> Path | None:
-    candidates = [
+def card_data_search_paths() -> list[Path]:
+    return [
         KAGGLE_INPUT / "pokemon-tcg-ai-battle" / "EN_Card_Data.csv",
         KAGGLE_INPUT / "competitions" / "pokemon-tcg-ai-battle" / "EN_Card_Data.csv",
         KAGGLE_INPUT / "datasets" / "competitions" / "pokemon-tcg-ai-battle" / "EN_Card_Data.csv",
         SCRIPT_DIR / "EN_Card_Data.csv",
         ROOT / "EN_Card_Data.csv",
     ]
+
+
+def find_card_data_csv() -> Path | None:
+    candidates = card_data_search_paths()
     for path in candidates:
         if path.exists():
             return path
@@ -123,8 +127,12 @@ def find_card_data_csv() -> Path | None:
 def load_card_table() -> pd.DataFrame:
     card_path = find_card_data_csv()
     if card_path is None:
-        print("EN_Card_Data.csv not found; signatures will treat all IDs as non-trainer unknown cards.")
-        return pd.DataFrame(columns=["card_id", "card_name", "card_kind"])
+        searched = [str(path) for path in card_data_search_paths()]
+        searched.append(str(ROOT / "pokemon-tcg-ai-battle.zip") + "::EN_Card_Data.csv")
+        raise FileNotFoundError(
+            "EN_Card_Data.csv is required for Pokémon+Energy grouping; searched: "
+            + ", ".join(searched)
+        )
     raw = pd.read_csv(card_path, encoding="utf-8-sig")
     table = pd.DataFrame(
         {
@@ -434,7 +442,9 @@ def build_popular_decks(deck_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
         if len(rows) < MIN_GROUP_GAMES:
             continue
 
-        full_deck_counts = Counter(tuple(row["deck"]) for row in rows)
+        # A full variant is a Card ID multiset. Replay/shuffle order is not deck
+        # identity, while Trainer copy-count differences remain distinct.
+        full_deck_counts = Counter(tuple(sorted(int(card_id) for card_id in row["deck"])) for row in rows)
         representative_deck_tuple, representative_count = full_deck_counts.most_common(1)[0]
         representative_deck = [int(card_id) for card_id in representative_deck_tuple]
         pe_counts = Counter(card_id for card_id in representative_deck if is_pokemon_or_energy(card_id))

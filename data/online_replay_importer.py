@@ -278,20 +278,17 @@ def select_daily_dataset_refs(
 def import_mounted_daily_replay_dataset(
     daily_replay_dirs: list[Path],
     output_dir: Path,
-    include_no_select: bool = False,
     controlled_agents: set[int] | None = None,
     max_samples: int | None = None,
 ) -> tuple[ReplayDecisionDataset, dict[str, Any]]:
     replay_paths, metadata = prepare_mounted_daily_replays(daily_replay_dirs, output_dir)
     dataset = ReplayDecisionDataset(
         replay_paths,
-        include_no_select=include_no_select,
         controlled_agents=controlled_agents,
         max_samples=max_samples,
     )
     metadata.update(
         {
-            "include_no_select": include_no_select,
             "controlled_agents": sorted(controlled_agents) if controlled_agents is not None else None,
             "max_samples": max_samples,
         }
@@ -471,20 +468,17 @@ def download_episode_replays(
 def import_online_replay_dataset(
     config: OnlineReplayImportConfig,
     client: ReplayApiClient | None = None,
-    include_no_select: bool = False,
     controlled_agents: set[int] | None = None,
     max_samples: int | None = None,
 ) -> tuple[ReplayDecisionDataset, dict[str, Any]]:
     replay_paths, metadata = prepare_online_replays(config, client=client)
     dataset = ReplayDecisionDataset(
         replay_paths,
-        include_no_select=include_no_select,
         controlled_agents=controlled_agents,
         max_samples=max_samples,
     )
     metadata["config"].update(
         {
-            "include_no_select": include_no_select,
             "controlled_agents": sorted(controlled_agents) if controlled_agents is not None else None,
             "max_samples": max_samples,
         }

@@ -28,7 +28,21 @@ python scripts/import_online_replay_decisions.py \
   --output-dir outputs/replay_extract
 ```
 
-该入口逐 replay 写出紧凑的 `decisions/decision_references.jsonl.gz` 和 `reports/replay_feature_audit.json`。完整 observation、日志、卡牌实例和 Memory 不重复写入；训练时按 decision key 回读原始 Replay 并重建八类输入。
+该入口只导出真实 `select` 决策点（无效的 `include_no_select` 接口已删除），逐 replay 写出紧凑的 `decisions/decision_references.jsonl.gz` 和 `reports/replay_feature_audit.json`。完整 observation、日志、卡牌实例和 Memory 不重复写入；训练时按含 `replay_key` 的 decision key 回读原始 Replay，并校验 source content hash、observation fingerprint、parser/schema version 后重建八类输入，任一不一致都会明确失败。
+
+热门牌组的完整 variant 使用 Card ID multiset，因此洗牌顺序不产生新 variant；Pokémon+Energy archetype 分组仍是独立逻辑。主流程依赖 `EN_Card_Data.csv` 的 Card Type，找不到时会列出搜索路径并停止，不会生成空 signature 结果。
+
+归一化统计必须明确训练时间窗，例如：
+
+```bash
+python scripts/normalize_replay_statistics.py \
+  --input-dir outputs/replay_extract/statistics \
+  --output-dir outputs/replay_extract/statistics_normalized \
+  --start-date 2026-07-01 \
+  --end-date 2026-07-14
+```
+
+也可重复传入 `--date YYYY-MM-DD`。`normalization_summary.json` 会保存 requested window、included/excluded dates 和实际 deck 总数；reserved/test 日期必须位于窗口外。
 
 ## cg Runtime
 

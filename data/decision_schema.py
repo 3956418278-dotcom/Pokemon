@@ -32,6 +32,7 @@ class ActionSemantics(str, Enum):
 
 @dataclass(frozen=True)
 class DecisionKey:
+    replay_key: str
     episode_id: int | None
     decision_step_index: int
     action_step_index: int
@@ -42,6 +43,7 @@ class DecisionKey:
 class OptionalField:
     value: Any
     state: FieldState
+    inference_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,8 @@ class LegalActionTarget:
     ordered_class_sequence: tuple[int, ...] = ()
     count_value: int | None = None
     count_value_to_option_indices: dict[int, tuple[int, ...]] | None = None
+    equivalence_resolution_status: str = "FULLY_RESOLVED"
+    policy_mask_reason: str = "REAL_POLICY_CHOICE"
 
 
 @dataclass(frozen=True)
@@ -134,25 +138,23 @@ class SerialRegistryRecord:
 class CardIdMemoryRecord:
     owner_relative: int
     card_id: int
-    exact_zone_counts: dict[str, int]
-    ambiguous_hidden_count: int
-    expected_zone_counts: dict[str, float]
-    presence_prediction: float | None
-    uncertainty: float | None
-    revealed_unique_copy_count: int
-    historical_seen_count: int
-    historical_move_count: int
-    first_seen_turn: int | None
-    last_seen_turn: int | None
+    currently_exact_zone_counts: dict[str, int]
+    ambiguous_serial_count: int
+    known_serial_count: int
+    visible_observation_count: int
+    movement_event_count: int
+    first_known_turn: int | None
+    last_known_turn: int | None
 
 
 @dataclass(frozen=True)
 class AnonymousHiddenPoolsRecord:
-    self_unresolved_deck_prize_count: int
+    self_unknown_deck_count: int
+    self_unknown_prize_count: int
     opponent_unknown_hand_count: int
     opponent_unknown_deck_count: int
     opponent_unknown_prize_count: int
-    anonymous_zone_transitions_by_side: dict[int, dict[str, int]]
+    cumulative_anonymous_zone_transitions_by_side: dict[int, dict[str, int]]
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,7 @@ class TrainingTargetsRecord:
     final_outcome: int | None
     hidden_truth_reference: str | None
     policy_loss_mask: bool
+    policy_mask_reason: str
 
 
 @dataclass(frozen=True)
