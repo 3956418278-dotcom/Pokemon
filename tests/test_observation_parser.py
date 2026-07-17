@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from data.decision_schema import DetailUsageState, FieldState
 from data.game_memory import GameMemoryState
 from data.observation_parser import parse_observation
 from data.state_schema import (
@@ -126,6 +127,9 @@ def test_parse_observation_preserves_visibility_and_instances() -> None:
     assert active.pre_evolution_card_ids == [20]
     assert any(x.attachment_kind == 1 and x.attached_to_serial == 10 for x in parsed.card_instances)
     assert any(x.area == AREA_IDS["LOOKING"] and not x.is_visible for x in parsed.card_instances)
+    states, sources = active.detail_usage(2)
+    assert states == [DetailUsageState.UNKNOWN, DetailUsageState.UNKNOWN]
+    assert sources == [None, None]
 
 
 def test_dynamic_batch_and_memory_shapes() -> None:
@@ -152,6 +156,42 @@ def test_log_type_zero_is_preserved() -> None:
     obs["logs"] = [{"type": 0, "playerIndex": 0}]
     parsed = parse_observation(obs)
     assert parsed.events[0].event_type == 0
+
+
+def test_events_keep_missingness_batch_position_and_player_relative_age() -> None:
+    first = parse_observation(_observation())
+    event = first.events[0]
+    assert event.actor_relative == 0
+    assert event.event_position_in_batch == 0
+    assert event.position_in_turn == 2
+    assert event.identity_visible
+    assert event.field_states["card_id"] is FieldState.PRESENT
+    assert event.field_states["coin_result"] is FieldState.MISSING
+
+    memory = GameMemoryState().update_from_parsed(first)
+    second_observation = _observation()
+    second_observation["current"]["turn"] = 4
+    second_observation["logs"] = []
+    memory.update_from_parsed(parse_observation(second_observation))
+    assert memory.recent_events[0].observation_age == 1
+    assert memory.recent_events[0].turn_delta == 1
+    # Memory owns temporal mutation; the arrival batch remains unchanged.
+    assert first.events[0].observation_age == 0
+
+
+def test_anonymous_hidden_pool_flows_are_separate_from_card_id_memory() -> None:
+    observation = _observation()
+    observation["logs"] = [
+        {"type": 7, "playerIndex": 1, "fromArea": 1, "toArea": 2, "quantity": 2}
+    ]
+    memory = GameMemoryState().update_from_parsed(parse_observation(observation))
+    pools = memory.anonymous_hidden_pools_record(your_index=0)
+    assert pools.anonymous_zone_transitions_by_side[1] == {
+        "anonymous_deck_out_count": 2,
+        "anonymous_hand_in_count": 2,
+    }
+    assert pools.opponent_unknown_hand_count == 6
+    assert memory.card_id_memory_records(your_index=0)
 
 
 def test_dynamic_batch_distinguishes_missing_hp_from_real_zero_and_preserves_serial_zero() -> None:

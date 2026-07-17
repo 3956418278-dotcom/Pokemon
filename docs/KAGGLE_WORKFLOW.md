@@ -13,6 +13,23 @@ kaggle kernels output f7e6n5g4/ptcg-popular-deck-extract \
 
 Kernel 内输出位于 `/kaggle/working/outputs/replay_extract/`。
 
+同一次公开 replay 遍历会写出热门牌组文件，以及：
+
+- `replays/replays.zip` 与 `replays/replay_index.csv`：每日期稳定选取最多 500 局，合并为一个归档；
+- `decks/YYYY-MM-DD/`：每个 episode/seat 至多一条完整牌组观察及当日热门牌组；
+- `statistics/YYYY-MM-DD/`：使用当日全部有效完整牌组计算的单卡与 pair 频率；
+- `reports/`：全局 extraction summary、errors、audit 与 import manifest。
+
+决策点导出继续使用现有入口，并统一写入相同目录：
+
+```bash
+python scripts/import_online_replay_decisions.py \
+  --daily-replay-dir /path/to/mounted/replays \
+  --output-dir outputs/replay_extract
+```
+
+该入口逐 replay 写出紧凑的 `decisions/decision_references.jsonl.gz` 和 `reports/replay_feature_audit.json`。完整 observation、日志、卡牌实例和 Memory 不重复写入；训练时按 decision key 回读原始 Replay 并重建八类输入。
+
 ## cg Runtime
 
 发布 builder 并下载构建结果：

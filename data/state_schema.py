@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Any, TYPE_CHECKING
 
+from .decision_schema import DetailUsageState, FieldState
+
 if TYPE_CHECKING:
     import torch
 
@@ -85,7 +87,7 @@ DECISION_FEATURE_DIM = 16
 MATCH_FEATURE_DIM = 16
 LEDGER_FEATURE_DIM = 20
 EVENT_FEATURE_DIM = 16
-MAX_RECENT_EVENTS = 16
+MAX_RECENT_EVENTS = 32
 
 NUMERICAL_FEATURE_NAMES = (
     "current_hp",
@@ -146,6 +148,9 @@ class CardInstanceState:
     detail_exists: bool | None = None
     static_artifact_known: bool | None = None
     source: str = "current"
+    field_states: dict[str, FieldState] = field(default_factory=dict)
+    used_detail_states: list[DetailUsageState] = field(default_factory=list)
+    used_detail_inference_sources: list[str | None] = field(default_factory=list)
 
     @property
     def static_card_id(self) -> int:
@@ -207,6 +212,14 @@ class CardInstanceState:
         ]
         return values, mask
 
+    def detail_usage(self, detail_count: int) -> tuple[list[DetailUsageState], list[str | None]]:
+        """Return aligned detail-use states, defaulting conservatively to UNKNOWN."""
+
+        default = DetailUsageState.UNKNOWN if self.is_pokemon else DetailUsageState.NOT_APPLICABLE
+        states = (self.used_detail_states + [default] * detail_count)[:detail_count]
+        sources = (self.used_detail_inference_sources + [None] * detail_count)[:detail_count]
+        return states, sources
+
 
 @dataclass
 class GlobalSnapshot:
@@ -231,19 +244,30 @@ class GlobalSnapshot:
     current_log_count: int = 0
     current_reverse_log_count: int = 0
     current_public_card_log_count: int = 0
+    field_states: dict[str, FieldState] = field(default_factory=dict)
 
     def features(self) -> list[float]:
         players = (self.player_counts + [{} for _ in range(2)])[:2]
+        first_player = (
+            self.first_player
+            if self.field_states.get("firstPlayer") is FieldState.PRESENT and self.first_player >= 0
+            else 0
+        )
+        result = (
+            self.result
+            if self.field_states.get("result") is FieldState.PRESENT and self.result >= 0
+            else 0
+        )
         values = [
             self.turn / 100.0,
             self.turn_action_count / 30.0,
             float(self.your_index),
-            self.first_player / 2.0,
+            first_player / 2.0,
             float(self.supporter_played),
             float(self.stadium_played),
             float(self.energy_attached),
             float(self.retreated),
-            self.result / 2.0,
+            result / 2.0,
             self.stadium_count,
             self.looking_count / 10.0,
             self.select_type / 12.0,
@@ -268,26 +292,41 @@ class GlobalSnapshot:
         return values[:GLOBAL_FEATURE_DIM]
 
     def decision_features(self) -> list[float]:
+        def present(name: str, value: int) -> int:
+            return value if self.field_states.get(name) is FieldState.PRESENT else 0
+
+        select_type = present("select.type", self.select_type)
+        select_context = present("select.context", self.select_context)
         values = [
-            self.select_type / 12.0,
-            self.select_context / 50.0,
-            self.select_min_count / 10.0,
-            self.select_max_count / 10.0,
-            self.remain_damage_counter / 100.0,
-            self.remain_energy_cost / 10.0,
-            float(self.select_type >= 0),
-            float(self.select_context >= 0),
+            select_type / 12.0,
+            select_context / 50.0,
+            present("select.minCount", self.select_min_count) / 10.0,
+            present("select.maxCount", self.select_max_count) / 10.0,
+            present("select.remainDamageCounter", self.remain_damage_counter) / 100.0,
+            present("select.remainEnergyCost", self.remain_energy_cost) / 10.0,
+            float(self.field_states.get("select.type") is FieldState.PRESENT),
+            float(self.field_states.get("select.context") is FieldState.PRESENT),
         ]
         values.extend([0.0] * DECISION_FEATURE_DIM)
         return values[:DECISION_FEATURE_DIM]
 
     def match_features(self) -> list[float]:
+        first_player = (
+            self.first_player
+            if self.field_states.get("firstPlayer") is FieldState.PRESENT and self.first_player >= 0
+            else 0
+        )
+        result = (
+            self.result
+            if self.field_states.get("result") is FieldState.PRESENT and self.result >= 0
+            else 0
+        )
         values = [
             self.turn / 100.0,
             self.turn_action_count / 30.0,
             float(self.your_index),
-            self.first_player / 2.0,
-            self.result / 2.0,
+            first_player / 2.0,
+            result / 2.0,
             float(self.supporter_played),
             float(self.stadium_played),
             float(self.energy_attached),
@@ -306,6 +345,7 @@ class GlobalSnapshot:
 class GameEvent:
     event_type: int
     player_index: int | None = None
+    actor_relative: int | None = None
     card_id: int | None = None
     serial: int | None = None
     from_area: int | None = None
@@ -314,7 +354,15 @@ class GameEvent:
     target_serial: int | None = None
     attack_id: int | None = None
     value: int | None = None
+    coin_result: int | None = None
     is_reverse: bool = False
+    identity_visible: bool = False
+    observation_age: int = 0
+    event_position_in_batch: int = 0
+    observed_turn: int = 0
+    turn_delta: int = 0
+    position_in_turn: int = 0
+    field_states: dict[str, FieldState] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -324,6 +372,11 @@ class ParsedObservation:
     card_instances: list[CardInstanceState]
     events: list[GameEvent]
     select_options: list[dict[str, Any]]
+    effect_reference: dict[str, Any] | None = None
+    context_card_reference: dict[str, Any] | None = None
+    effect_presence: FieldState = FieldState.NOT_APPLICABLE
+    context_card_presence: FieldState = FieldState.NOT_APPLICABLE
+    option_field_states: list[dict[str, FieldState]] = field(default_factory=list)
 
 
 @dataclass

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 
 from .state_schema import (
@@ -11,6 +12,7 @@ from .state_schema import (
     ParsedObservation,
     MAX_RECENT_EVENTS,
 )
+from .decision_schema import AnonymousHiddenPoolsRecord, CardIdMemoryRecord
 
 
 @dataclass
@@ -21,6 +23,11 @@ class SerialMemory:
     first_seen_turn: int = 0
     last_seen_turn: int = 0
     current_area: int | None = None
+    previous_area: int | None = None
+    possible_hidden_zone_mask: int = 0
+    currently_visible: bool = False
+    last_seen_observation: int = 0
+    last_event_type: int | None = None
     seen_count: int = 0
     moved_count: int = 0
     played: bool = False
@@ -37,11 +44,23 @@ class GameMemoryState:
     recent_events: list[GameEvent] = field(default_factory=list)
     public_counts_by_player: dict[int, dict[str, int]] = field(default_factory=dict)
     max_recent_events: int = MAX_RECENT_EVENTS
+    observation_count: int = 0
+    anonymous_zone_transitions: dict[int, dict[str, int]] = field(default_factory=dict)
 
     def update_from_parsed(self, parsed: ParsedObservation) -> "GameMemoryState":
+        self.observation_count += 1
         turn = parsed.global_snapshot.turn
+        for event in self.recent_events:
+            event.observation_age += 1
+            event.turn_delta = max(0, turn - event.observed_turn)
         for player_index, counts in enumerate(parsed.global_snapshot.player_counts):
             self.public_counts_by_player[player_index] = dict(counts)
+        # The batch logs describe transitions leading to the current snapshot.
+        # Apply them first, then let exact current visibility set the final zone.
+        for event in parsed.events:
+            self._apply_event(event, turn)
+        for memory in self.serials.values():
+            memory.currently_visible = False
         for instance in parsed.card_instances:
             if instance.serial is None:
                 continue
@@ -58,14 +77,19 @@ class GameMemoryState:
                 memory.card_id = instance.card_id
             memory.player_index = instance.player_index
             memory.last_seen_turn = turn
+            memory.last_seen_observation = self.observation_count
+            if memory.current_area != instance.area:
+                memory.previous_area = memory.current_area
             memory.current_area = instance.area
+            memory.possible_hidden_zone_mask = 0
+            memory.currently_visible = bool(instance.is_visible)
             memory.seen_count += 1
             if instance.zone == "discard":
                 memory.discarded_public = True
-        for event in parsed.events:
-            self._apply_event(event, turn)
         if parsed.events:
-            self.recent_events.extend(parsed.events)
+            # Memory owns event age/turn-delta updates; ParsedObservation remains
+            # an immutable snapshot of the arrival batch.
+            self.recent_events.extend(copy.deepcopy(parsed.events))
             self.recent_events = self.recent_events[-self.max_recent_events :]
         return self
 
@@ -89,11 +113,43 @@ class GameMemoryState:
         return memory
 
     def _apply_event(self, event: GameEvent, turn: int) -> None:
+        if event.card_id is None and event.player_index is not None:
+            zone_names = {1: "deck", 2: "hand", 6: "prize"}
+            quantity = event.raw.get("quantity", 1)
+            try:
+                quantity = max(0, int(quantity))
+            except (TypeError, ValueError):
+                quantity = 1
+            counters = self.anonymous_zone_transitions.setdefault(event.player_index, {})
+            if event.from_area in zone_names:
+                key = f"anonymous_{zone_names[event.from_area]}_out_count"
+                counters[key] = counters.get(key, 0) + quantity
+            if event.to_area in zone_names:
+                key = f"anonymous_{zone_names[event.to_area]}_in_count"
+                counters[key] = counters.get(key, 0) + quantity
         memory = self._memory_for_event(event, turn)
         if memory is None:
+            if event.from_area is not None and event.player_index is not None:
+                possible_mask = 1 << int(event.from_area)
+                if event.to_area is not None:
+                    possible_mask |= 1 << int(event.to_area)
+                for candidate in self.serials.values():
+                    if (
+                        candidate.player_index == event.player_index
+                        and candidate.current_area == event.from_area
+                    ):
+                        candidate.previous_area = candidate.current_area
+                        candidate.current_area = None
+                        candidate.possible_hidden_zone_mask |= possible_mask
+                        candidate.last_event_type = event.event_type
             return
+        memory.last_event_type = event.event_type
+        memory.last_seen_observation = self.observation_count
         if event.to_area is not None:
+            if memory.current_area != event.to_area:
+                memory.previous_area = memory.current_area
             memory.current_area = event.to_area
+            memory.possible_hidden_zone_mask = 0
         if event.from_area is not None or event.to_area is not None:
             memory.moved_count += 1
         if event.event_type == 10:
@@ -108,6 +164,113 @@ class GameMemoryState:
             memory.damaged = True
         if event.to_area == 3:
             memory.discarded_public = True
+
+    def anonymous_hidden_pools_record(self, your_index: int) -> AnonymousHiddenPoolsRecord:
+        """Derive current unknown pool sizes and retain anonymous flow facts."""
+
+        opponent_index = 1 - your_index if your_index in (0, 1) else -1
+
+        def public(player_index: int, zone: str) -> int:
+            return int(self.public_counts_by_player.get(player_index, {}).get(zone, 0))
+
+        def exact(player_index: int, area: int) -> int:
+            return sum(
+                memory.player_index == player_index and memory.current_area == area
+                for memory in self.serials.values()
+            )
+
+        transitions: dict[int, dict[str, int]] = {}
+        for absolute_player, counts in self.anonymous_zone_transitions.items():
+            relative = 0 if absolute_player == your_index else 1
+            transitions[relative] = dict(counts)
+        return AnonymousHiddenPoolsRecord(
+            self_unresolved_deck_prize_count=max(
+                0,
+                public(your_index, "deck")
+                + public(your_index, "prize")
+                - exact(your_index, 1)
+                - exact(your_index, 6),
+            ),
+            opponent_unknown_hand_count=max(
+                0, public(opponent_index, "hand") - exact(opponent_index, 2)
+            ),
+            opponent_unknown_deck_count=max(
+                0, public(opponent_index, "deck") - exact(opponent_index, 1)
+            ),
+            opponent_unknown_prize_count=max(
+                0, public(opponent_index, "prize") - exact(opponent_index, 6)
+            ),
+            anonymous_zone_transitions_by_side=transitions,
+        )
+
+    def card_id_memory_records(
+        self,
+        your_index: int,
+        *,
+        expected_zone_counts: dict[tuple[int, int], dict[str, float]] | None = None,
+        presence_predictions: dict[tuple[int, int], float] | None = None,
+        uncertainty: dict[tuple[int, int], float] | None = None,
+    ) -> list[CardIdMemoryRecord]:
+        """Derive Card ID memory from the serial registry without mutable ledger state."""
+
+        expected_zone_counts = expected_zone_counts or {}
+        presence_predictions = presence_predictions or {}
+        uncertainty = uncertainty or {}
+
+        area_names = {
+            1: "DECK",
+            2: "HAND",
+            3: "DISCARD",
+            4: "ACTIVE",
+            5: "BENCH",
+            6: "PRIZE",
+            7: "STADIUM",
+            8: "ENERGY",
+            9: "TOOL",
+            10: "PRE_EVOLUTION",
+            12: "LOOKING",
+        }
+        grouped: dict[tuple[int, int], list[SerialMemory]] = {}
+        for memory in self.serials.values():
+            if memory.card_id is None or memory.player_index is None:
+                continue
+            owner_relative = 0 if memory.player_index == your_index else 1
+            grouped.setdefault((owner_relative, int(memory.card_id)), []).append(memory)
+        keys = set(grouped) | set(expected_zone_counts) | set(presence_predictions) | set(uncertainty)
+        records = []
+        for owner_relative, card_id in sorted(keys):
+            memories = grouped.get((owner_relative, card_id), [])
+            exact_counts: dict[str, int] = {}
+            for memory in memories:
+                if memory.current_area in area_names:
+                    name = area_names[int(memory.current_area)]
+                    exact_counts[name] = exact_counts.get(name, 0) + 1
+            records.append(
+                CardIdMemoryRecord(
+                    owner_relative=owner_relative,
+                    card_id=card_id,
+                    exact_zone_counts=exact_counts,
+                    ambiguous_hidden_count=sum(
+                        memory.current_area is None and memory.possible_hidden_zone_mask != 0
+                        for memory in memories
+                    ),
+                    expected_zone_counts=dict(
+                        expected_zone_counts.get((owner_relative, card_id), {})
+                    ),
+                    presence_prediction=presence_predictions.get((owner_relative, card_id)),
+                    uncertainty=uncertainty.get((owner_relative, card_id)),
+                    revealed_unique_copy_count=len(memories),
+                    historical_seen_count=sum(memory.seen_count for memory in memories),
+                    historical_move_count=sum(memory.moved_count for memory in memories),
+                    first_seen_turn=(
+                        min(memory.first_seen_turn for memory in memories) if memories else None
+                    ),
+                    last_seen_turn=(
+                        max(memory.last_seen_turn for memory in memories) if memories else None
+                    ),
+                )
+            )
+        return records
 
     def appearance_features(self, instances: list[CardInstanceState]) -> list[list[float]]:
         rows: list[list[float]] = []
@@ -174,7 +337,7 @@ class GameMemoryState:
         for event in self.recent_events[-self.max_recent_events :]:
             features = [0.0] * EVENT_FEATURE_DIM
             features[0] = event.event_type / 24.0
-            features[1] = -1.0 if event.player_index is None else float(event.player_index)
+            features[1] = 0.0 if event.actor_relative is None else float(event.actor_relative)
             features[2] = float(event.card_id or 0) / 1300.0
             features[3] = float(event.serial or 0) / 100.0
             features[4] = float(event.from_area or 0) / 12.0
@@ -187,5 +350,7 @@ class GameMemoryState:
             features[11] = float(event.event_type in {10, 11, 12, 15})
             features[12] = float(event.event_type in {16, 17, 18, 19, 20, 21})
             features[13] = float(event.event_type in {4, 5, 6, 7})
+            features[14] = min(event.observation_age, 32) / 32.0
+            features[15] = min(event.event_position_in_batch, 32) / 32.0
             rows.append(features)
         return rows

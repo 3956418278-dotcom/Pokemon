@@ -9,7 +9,24 @@
   "enable_tpu": false,
   "enable_internet": true,
   "machine_shape": "",
-  "dataset_sources": [],
+  "dataset_sources": [
+    "kaggle/pokemon-tcg-ai-battle-episodes-index",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-01",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-02",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-03",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-04",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-05",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-06",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-07",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-08",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-09",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-10",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-11",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-12",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-13",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-14",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-15"
+  ],
   "competition_sources": [
     "pokemon-tcg-ai-battle"
   ],

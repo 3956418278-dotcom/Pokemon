@@ -49,7 +49,7 @@ def test_online_replay_importer_uses_client_and_builds_dataset(tmp_path: Path) -
                 "steps": [
                     [
                         {
-                            "action": [0],
+                                "action": [],
                             "observation": {
                                 "current": None,
                                 "logs": [],
@@ -69,7 +69,7 @@ def test_online_replay_importer_uses_client_and_builds_dataset(tmp_path: Path) -
     assert metadata["downloaded_replay_paths"]
     assert len(dataset) > 0
     assert dataset.summary.parser_errors == []
-    assert (tmp_path / "online_import_manifest.json").exists()
+    assert (tmp_path / "reports/online_import_manifest.json").exists()
 
 
 def test_mounted_episode_index_reserves_recent_days(tmp_path: Path) -> None:
@@ -138,7 +138,7 @@ def test_import_mounted_daily_replay_dataset_accepts_plain_json_names(tmp_path: 
                 "steps": [
                     [
                         {
-                            "action": [0],
+                            "action": [],
                             "observation": {"current": None, "logs": [], "select": None},
                             "reward": 0,
                             "status": "ACTIVE",
@@ -146,11 +146,23 @@ def test_import_mounted_daily_replay_dataset_accepts_plain_json_names(tmp_path: 
                     ],
                     [
                         {
-                            "action": [1],
+                            "action": [],
                             "observation": {
                                 "current": None,
                                 "logs": [],
                                 "select": {"type": 9, "context": 41, "minCount": 1, "maxCount": 1, "option": [{"type": 1}]},
+                            },
+                            "reward": 0,
+                            "status": "ACTIVE",
+                        }
+                    ],
+                    [
+                        {
+                            "action": [0],
+                            "observation": {
+                                "current": None,
+                                "logs": [],
+                                "select": None,
                             },
                             "reward": 0,
                             "status": "ACTIVE",

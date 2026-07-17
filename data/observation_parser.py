@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
+from .decision_schema import FieldState
 from .state_schema import AREA_IDS, CardInstanceState, GameEvent, GlobalSnapshot, ParsedObservation
 
 
@@ -21,6 +22,19 @@ def _has_field(obj: Any, name: str) -> bool:
     if isinstance(obj, dict):
         return name in obj
     return hasattr(obj, name)
+
+
+def _field_state(obj: Any, name: str, *, applicable: bool = True) -> FieldState:
+    if not applicable:
+        return FieldState.NOT_APPLICABLE
+    if not _has_field(obj, name):
+        return FieldState.MISSING
+    value = _value(obj, name)
+    if value is None:
+        return FieldState.EXPLICIT_NULL
+    if isinstance(value, int) and value < 0:
+        return FieldState.UNKNOWN
+    return FieldState.PRESENT
 
 
 def _int(value: Any, default: int | None = 0) -> int | None:
@@ -63,6 +77,10 @@ def _card_instance(card: Any, area: int, zone: str, slot: int, your_index: int, 
         slot=slot,
         copy_count=1 if card_id is not None else None,
         source=source,
+        field_states={
+            name: _field_state(card, name)
+            for name in ("id", "serial", "playerIndex")
+        },
     )
 
 
@@ -77,6 +95,13 @@ def _hidden_instance(area: int, zone: str, slot: int, player_index: int | None, 
         slot=slot,
         is_visible=False,
         is_face_down=True,
+        field_states={
+            "id": FieldState.EXPLICIT_NULL,
+            "serial": FieldState.EXPLICIT_NULL,
+            "playerIndex": (
+                FieldState.PRESENT if player_index is not None else FieldState.UNKNOWN
+            ),
+        },
     )
 
 
@@ -150,6 +175,21 @@ def _pokemon_instance(
         special_conditions=(conditions or [False] * 5),
         special_conditions_valid=conditions_valid,
         copy_count=1 if card_id is not None else None,
+        field_states={
+            name: _field_state(pokemon, name)
+            for name in (
+                "id",
+                "serial",
+                "playerIndex",
+                "hp",
+                "maxHp",
+                "appearThisTurn",
+                "energies",
+                "energyCards",
+                "tools",
+                "preEvolution",
+            )
+        },
     )
     attached: list[CardInstanceState] = [instance]
     for index, card in enumerate(energy_cards):
@@ -173,8 +213,46 @@ def _pokemon_instance(
 def parse_global_snapshot(observation: Any) -> GlobalSnapshot:
     state = _value(observation, "current")
     select = _value(observation, "select")
+    tracked_state_fields = (
+        "turn",
+        "turnActionCount",
+        "yourIndex",
+        "firstPlayer",
+        "supporterPlayed",
+        "stadiumPlayed",
+        "energyAttached",
+        "retreated",
+        "result",
+        "stadium",
+        "looking",
+        "players",
+    )
+    tracked_select_fields = (
+        "type",
+        "context",
+        "minCount",
+        "maxCount",
+        "remainDamageCounter",
+        "remainEnergyCost",
+        "effect",
+        "contextCard",
+    )
+    field_states = {
+        name: _field_state(state, name, applicable=state is not None)
+        for name in tracked_state_fields
+    }
+    field_states.update(
+        {
+            f"select.{name}": _field_state(select, name, applicable=select is not None)
+            for name in tracked_select_fields
+        }
+    )
     if state is None:
-        return GlobalSnapshot()
+        return GlobalSnapshot(field_states=field_states)
+    if _int(_value(state, "firstPlayer"), -1) == -1:
+        field_states["firstPlayer"] = FieldState.UNKNOWN
+    if _int(_value(state, "result"), -1) == -1:
+        field_states["result"] = FieldState.UNKNOWN
     your_index = _int(_value(state, "yourIndex"), 0) or 0
     players = _value(state, "players", []) or []
     player_counts = []
@@ -189,6 +267,9 @@ def parse_global_snapshot(observation: Any) -> GlobalSnapshot:
                 "hand": _int(_value(player, "handCount"), 0) or 0,
             }
         )
+    for player_index, player in enumerate(players[:2]):
+        for name in ("active", "bench", "benchMax", "deckCount", "discard", "prize", "handCount", "hand"):
+            field_states[f"players[{player_index}].{name}"] = _field_state(player, name)
     looking = _value(state, "looking")
     logs = _value(observation, "logs", []) or []
     log_count = len(logs)
@@ -222,6 +303,7 @@ def parse_global_snapshot(observation: Any) -> GlobalSnapshot:
         current_log_count=log_count,
         current_reverse_log_count=reverse_log_count,
         current_public_card_log_count=public_card_log_count,
+        field_states=field_states,
     )
 
 
@@ -273,6 +355,18 @@ def parse_card_instances(observation: Any) -> list[CardInstanceState]:
                 instances.append(_hidden_instance(AREA_IDS["LOOKING"], "looking", index, None, your_index))
             else:
                 instances.append(_card_instance(card, AREA_IDS["LOOKING"], "looking", index, your_index))
+    select = _value(observation, "select")
+    select_deck = _value(select, "deck")
+    if select_deck is not None:
+        existing_serials = {instance.serial for instance in instances if instance.serial is not None}
+        for index, card in enumerate(select_deck or []):
+            if card is None:
+                instances.append(_hidden_instance(AREA_IDS["LOOKING"], "select.deck", index, your_index, your_index))
+                continue
+            serial = _int(_value(card, "serial"), None)
+            if serial is not None and serial in existing_serials:
+                continue
+            instances.append(_card_instance(card, AREA_IDS["LOOKING"], "select.deck", index, your_index, source="select.deck"))
     counts = Counter(
         (instance.relative_player, instance.area, int(instance.card_id))
         for instance in instances
@@ -286,24 +380,53 @@ def parse_card_instances(observation: Any) -> list[CardInstanceState]:
 
 def parse_events(observation: Any) -> list[GameEvent]:
     events: list[GameEvent] = []
-    for log in _value(observation, "logs", []) or []:
+    current = _value(observation, "current")
+    your_index = _int(_value(current, "yourIndex"), 0) or 0
+    turn = _int(_value(current, "turn"), 0) or 0
+    turn_action_count = _int(_value(current, "turnActionCount"), 0) or 0
+    for event_position, log in enumerate(_value(observation, "logs", []) or []):
         event_type = _int(_value(log, "type"), -1)
         from_area = _int(_value(log, "fromArea"), None)
         to_area = _int(_value(log, "toArea"), None)
+        player_index = _int(_value(log, "playerIndex"), None)
+        card_id = _int(_value(log, "cardId"), None)
+        serial = _int(_value(log, "serial"), None)
         raw = _raw(log)
         events.append(
             GameEvent(
                 event_type=event_type,
-                player_index=_int(_value(log, "playerIndex"), None),
-                card_id=_int(_value(log, "cardId"), None),
-                serial=_int(_value(log, "serial"), None),
+                player_index=player_index,
+                actor_relative=_relative(player_index, your_index),
+                card_id=card_id,
+                serial=serial,
                 from_area=from_area,
                 to_area=to_area,
                 target_card_id=_int(_value(log, "cardIdTarget"), None),
                 target_serial=_int(_value(log, "serialTarget"), None),
                 attack_id=_int(_value(log, "attackId"), None),
                 value=_int(_value(log, "value"), None),
+                coin_result=_int(_value(log, "coinResult"), None),
                 is_reverse=event_type in {5, 7},
+                identity_visible=card_id is not None,
+                event_position_in_batch=event_position,
+                observed_turn=turn,
+                position_in_turn=turn_action_count,
+                field_states={
+                    canonical: _field_state(log, raw_name)
+                    for canonical, raw_name in (
+                        ("event_type", "type"),
+                        ("player_index", "playerIndex"),
+                        ("card_id", "cardId"),
+                        ("serial", "serial"),
+                        ("from_area", "fromArea"),
+                        ("to_area", "toArea"),
+                        ("target_card_id", "cardIdTarget"),
+                        ("target_serial", "serialTarget"),
+                        ("attack_id", "attackId"),
+                        ("value", "value"),
+                        ("coin_result", "coinResult"),
+                    )
+                },
                 raw=raw,
             )
         )
@@ -318,9 +441,38 @@ def parse_select_options(observation: Any) -> list[dict[str, Any]]:
 
 
 def parse_observation(observation: Any) -> ParsedObservation:
+    select = _value(observation, "select")
+    effect = _value(select, "effect")
+    context_card = _value(select, "contextCard")
     return ParsedObservation(
         global_snapshot=parse_global_snapshot(observation),
         card_instances=parse_card_instances(observation),
         events=parse_events(observation),
         select_options=parse_select_options(observation),
+        effect_reference=_raw(effect) if effect is not None else None,
+        context_card_reference=_raw(context_card) if context_card is not None else None,
+        effect_presence=_field_state(select, "effect", applicable=select is not None),
+        context_card_presence=_field_state(select, "contextCard", applicable=select is not None),
+        option_field_states=[
+            {
+                name: _field_state(option, name)
+                for name in (
+                    "type",
+                    "number",
+                    "area",
+                    "index",
+                    "playerIndex",
+                    "toolIndex",
+                    "energyIndex",
+                    "count",
+                    "inPlayArea",
+                    "inPlayIndex",
+                    "attackId",
+                    "cardId",
+                    "serial",
+                    "specialConditionType",
+                )
+            }
+            for option in (_value(select, "option", []) or [])
+        ],
     )

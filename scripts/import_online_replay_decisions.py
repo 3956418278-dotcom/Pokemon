@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
 from pathlib import Path
@@ -12,37 +11,11 @@ if str(ROOT) not in sys.path:
 
 from data.online_replay_importer import (
     OnlineReplayImportConfig,
-    import_mounted_daily_replay_dataset,
-    import_online_replay_dataset,
+    prepare_mounted_daily_replays,
+    prepare_online_replays,
     select_daily_dataset_refs,
 )
-
-
-def write_index_csv(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "index",
-        "replay_id",
-        "episode_id",
-        "step_index",
-        "agent_index",
-        "action",
-        "reward",
-        "status",
-        "option_count",
-        "select_type",
-        "select_context",
-        "instance_count",
-        "event_count",
-        "recent_event_count",
-    ]
-    with path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            out = dict(row)
-            out["action"] = json.dumps(out["action"])
-            writer.writerow(out)
+from data.replay_dataset import export_replay_decisions
 
 
 def main() -> None:
@@ -56,7 +29,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / "outputs/replay_extract/online_replays",
+        default=ROOT / "outputs/replay_extract",
     )
     parser.add_argument(
         "--episodes-index-dir",
@@ -111,13 +84,7 @@ def main() -> None:
         )
         daily_dirs.extend([ref.mount_path for ref in daily_refs if ref.mount_path is not None])
     if daily_dirs:
-        dataset, metadata = import_mounted_daily_replay_dataset(
-            daily_dirs,
-            output_dir=args.output_dir,
-            include_no_select=args.include_no_select,
-            controlled_agents=controlled,
-            max_samples=args.max_samples,
-        )
+        replay_paths, metadata = prepare_mounted_daily_replays(daily_dirs, output_dir=args.output_dir)
         metadata["daily_dataset_refs"] = [
             {
                 "date": ref.date,
@@ -129,7 +96,9 @@ def main() -> None:
             }
             for ref in daily_refs
         ]
-        (args.output_dir / "online_import_manifest.json").write_text(
+        reports_dir = args.output_dir / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / "online_import_manifest.json").write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
@@ -147,32 +116,33 @@ def main() -> None:
             import_split=args.import_split,
             output_dir=args.output_dir,
         )
-        dataset, metadata = import_online_replay_dataset(
-            config,
-            include_no_select=args.include_no_select,
-            controlled_agents=controlled,
-            max_samples=args.max_samples,
-        )
-    summary = {
-        "online_import": metadata,
-        "dataset": {
-            "replay_count": dataset.summary.replay_count,
-            "sample_count": dataset.summary.sample_count,
-            "skipped_no_select": dataset.summary.skipped_no_select,
-            "parser_errors": dataset.summary.parser_errors[:20],
-            "max_instances": dataset.summary.max_instances,
-            "max_options": dataset.summary.max_options,
-            "max_events": dataset.summary.max_events,
-            "max_token_estimate": dataset.summary.max_token_estimate,
-        },
-    }
-    summary_path = args.output_dir / "decision_dataset_summary.json"
-    index_path = args.output_dir / "decision_index.csv"
+        replay_paths, metadata = prepare_online_replays(config)
+    decision_summary = export_replay_decisions(
+        replay_paths,
+        args.output_dir,
+        include_no_select=args.include_no_select,
+        controlled_agents=controlled,
+        max_samples=args.max_samples,
+    )
+    reports_dir = args.output_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = reports_dir / "extraction_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    summary.update(
+        {
+            "online_import": metadata,
+            "decision_sample_count": decision_summary["decision_sample_count"],
+            "steps_per_replay": decision_summary["steps_per_replay"],
+            "decisions_per_replay": decision_summary["decisions_per_replay"],
+            "max_card_instances": decision_summary["max_card_instances"],
+            "max_legal_options": decision_summary["max_legal_options"],
+            "observation_parser_error_count": decision_summary["observation_parser_error_count"],
+            "decision_export": decision_summary,
+        }
+    )
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    write_index_csv(index_path, dataset.to_index_rows())
-    print(json.dumps(summary["dataset"], indent=2, ensure_ascii=False))
+    print(json.dumps(decision_summary, indent=2, ensure_ascii=False))
     print("wrote", summary_path)
-    print("wrote", index_path)
 
 
 if __name__ == "__main__":

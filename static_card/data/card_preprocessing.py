@@ -14,8 +14,8 @@ from statistics import mean
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CACHE_DIR = ROOT / "artifacts" / "card_data"
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CACHE_DIR = ROOT / "static_card" / "artifacts" / "card_data"
 ENERGY_TYPES = ["C", "G", "R", "W", "L", "P", "F", "D", "M", "N", "Y", "A"]
 CG_ENERGY_TYPES = {0: "C", 1: "G", 2: "R", 3: "W", 4: "L", 5: "P", 6: "F", 7: "D", 8: "M", 9: "N", 10: "Y"}
 CG_CARD_TYPES = {0: "POKEMON", 1: "ITEM", 2: "TOOL", 3: "SUPPORTER", 4: "STADIUM", 5: "BASIC_ENERGY", 6: "SPECIAL_ENERGY"}
@@ -80,6 +80,12 @@ class CardRecord:
     attack_energy_costs: list[dict[str, int]]
     trainer_type: str | None
     provided_energy_types: list[str]
+    provided_energy_counts: list[int]
+    provided_energy_amount: int | None
+    provided_energy_allowed_types: list[str]
+    provided_energy_mode: str | None
+    attachment_restriction: str | None
+    invalid_attachment_effect: str | None
     full_effect_text: str
     attack_ids: list[int]
     detail_start: int
@@ -223,7 +229,7 @@ def read_csv_from_zip(zip_path: Path, member: str) -> list[dict[str, str]]:
 
 
 def find_card_csv() -> Path | None:
-    candidates = [ROOT / "EN_Card_Data.csv", ROOT / "kaggle_extract" / "EN_Card_Data.csv", Path("/kaggle/input/pokemon-tcg-ai-battle/EN_Card_Data.csv"), Path("/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv")]
+    candidates = [ROOT / "EN_Card_Data.csv", ROOT / "kaggle" / "kaggle_extract" / "EN_Card_Data.csv", Path("/kaggle/input/pokemon-tcg-ai-battle/EN_Card_Data.csv"), Path("/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv")]
     for path in candidates:
         if path.exists():
             return path
@@ -251,7 +257,7 @@ def load_csv_rows() -> tuple[list[dict[str, str]], str, str]:
 def load_cg_data(required: bool = True) -> tuple[dict[int, Any], dict[int, Any]]:
     import_roots = [ROOT]
 
-    local_runtime = ROOT / "kaggle_cg_runtime_dataset"
+    local_runtime = ROOT / "kaggle" / "datasets" / "cg_runtime"
     if (local_runtime / "cg" / "__init__.py").exists():
         import_roots.append(local_runtime)
 
@@ -288,11 +294,11 @@ def _detail_type(row: dict[str, str]) -> str | None:
     fields = [normalize_missing(row[x]) for x in ("Move Name", "Cost", "Damage", "Effect Explanation")]
     if not any(fields):
         return None
-    if normalize_missing(row["Category"]) == "Fossil":
-        return "CARD_EFFECT"
     name = normalize_missing(row["Move Name"])
     if name.startswith("[Ability]"):
         return "ABILITY"
+    if normalize_missing(row["Category"]) == "Fossil":
+        return "CARD_EFFECT"
     if normalize_missing(row["Cost"]) or normalize_missing(row["Damage"]):
         return "ATTACK"
     return "CARD_EFFECT"
@@ -303,7 +309,7 @@ def _detail_subtype(row: dict[str, str], detail_type: str) -> str:
     if detail_type == "ATTACK":
         return "TOOL_ATTACK" if "Tool" in kind else "POKEMON_ATTACK"
     if detail_type == "ABILITY":
-        return "POKEMON_ABILITY"
+        return "FOSSIL_ABILITY" if tag == "Fossil" else "POKEMON_ABILITY"
     if tag == "Fossil":
         return "FOSSIL_EFFECT"
     if tag == "Technical Machine":
@@ -378,7 +384,6 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
                 ).strip()
             else:
                 detail_name = move_name
-           ##########################
             attack_id = attack_binding.get(source_row)
             counts = [0] * len(ENERGY_TYPES)
             damage_base, damage_mode = parse_damage_fields(row["Damage"])
@@ -406,8 +411,7 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
                 attack_costs.append({name: count for name, count in zip(ENERGY_TYPES, counts) if count})
             elif detail_type == "ABILITY":
                 if cid == 481:
-                    
-                    matching = [skill for skill in (cg_card.skills or []) if _norm_identity(skill.name) == _norm_identity(source_ability_name)]
+                    matching = [skill for skill in (cg_card.skills or []) if _norm_identity(skill.name) == _norm_identity(detail_name)]
                     if len(matching) != 1:
                         raise ValueError(f"card {card_id} ability CG binding failed: {move_name}")
                     text = normalize_missing(matching[0].text)
@@ -416,7 +420,7 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
             detail = DetailRecord(
                 detail_index=len(details), card_id=card_id, source_row=source_row, source_line=source_row + 2,
                 detail_type=detail_type, detail_subtype=_detail_subtype(row, detail_type), move_name=move_name,
-                detail_name=detail_name ,text=text, source_text=source_text, attack_id=attack_id, energy_counts=counts,
+                detail_name=detail_name, text=text, source_text=source_text, attack_id=attack_id, energy_counts=counts,
                 damage_raw=normalize_missing(row["Damage"]) or None, damage_base=damage_base,
                 damage_mode=damage_mode, corrections=row_corrections,
                 source_fields={column: row[column] for column in SOURCE_COLUMNS[13:]},
@@ -436,7 +440,24 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
         expected_source_flag = {"Pokémon ex": "POKEMON_EX", "Mega Pokémon ex": "MEGA_POKEMON_EX", "ACE SPEC": "ACE_SPEC"}.get(source_rule)
         if source_rule and expected_source_flag not in rule_flags:
             raise ValueError(f"card {card_id} rule mismatch: {source_rule} vs {rule_flags}")
-        provided = parse_energy_symbols(first["Type"]) if "ENERGY" in card_type else []
+        printed_provided = parse_energy_symbols(first["Type"]) if "ENERGY" in card_type else []
+        printed_provided_counts = Counter(printed_provided)
+        provided_energy_counts = [int(printed_provided_counts.get(energy, 0)) for energy in ENERGY_TYPES]
+        provided_energy_amount = len(printed_provided) if printed_provided else None
+        provided_energy_allowed_types = sorted(
+            set(printed_provided),
+            key=lambda value: ENERGY_TYPES.index(value) if value in ENERGY_TYPES else len(ENERGY_TYPES),
+        )
+        provided_energy_mode = "PRINTED_PROFILE" if printed_provided else None
+        attachment_restriction = None
+        invalid_attachment_effect = None
+        if cid == 15:
+            provided_energy_counts = [0] * len(ENERGY_TYPES)
+            provided_energy_amount = 2
+            provided_energy_allowed_types = ["P", "D"]
+            provided_energy_mode = "CHOOSE_ANY_COMBINATION"
+            attachment_restriction = "TEAM_ROCKET_POKEMON_ONLY"
+            invalid_attachment_effect = "DISCARD"
         pokemon_type = CG_ENERGY_TYPES.get(int(cg_card.energyType)) if card_type == "POKEMON" else None
         hp = parse_int(first["HP"])
         if hp is None and card_type in {"ITEM", "TOOL"} and int(cg_card.hp) > 0:
@@ -453,25 +474,32 @@ def build_corpus() -> tuple[list[CardRecord], list[DetailRecord], list[int], dic
             evolves_from=normalize_missing(first["Previous stage"]) or None, evolves_to=sorted(evolves_to.get(normalize_missing(first["Card Name"]), set())),
             rule_flags=rule_flags, ability_texts=ability_texts, attack_texts=attack_texts, attack_names=attack_names,
             attack_damage=attack_damage, attack_energy_costs=attack_costs, trainer_type=trainer_type_from_card_type(card_type),
-            provided_energy_types=provided, full_effect_text="\n".join(effects), attack_ids=attack_ids,
+            provided_energy_types=provided_energy_allowed_types,
+            provided_energy_counts=provided_energy_counts,
+            provided_energy_amount=provided_energy_amount,
+            provided_energy_allowed_types=provided_energy_allowed_types,
+            provided_energy_mode=provided_energy_mode,
+            attachment_restriction=attachment_restriction,
+            invalid_attachment_effect=invalid_attachment_effect,
+            full_effect_text="\n".join(effects), attack_ids=attack_ids,
             detail_start=offsets[-1], detail_end=len(details),
             source_fields={column: first[column] for column in CARD_LEVEL_COLUMNS},
         ))
         offsets.append(len(details))
 
     type_counts = Counter(x.detail_type for x in details)
-    expected = {"ATTACK": 1556, "ABILITY": 218, "CARD_EFFECT": 240}
+    expected = {"ATTACK": 1556, "ABILITY": 223, "CARD_EFFECT": 235}
     if len(rows) != 2022 or len(cards) != 1267 or len(details) != 2014 or dict(type_counts) != expected or len(offsets) != 1268:
         raise ValueError(f"canonical corpus invariant failed: rows={len(rows)} cards={len(cards)} details={len(details)} types={dict(type_counts)} offsets={len(offsets)}")
     manifest = {
-        "schema_version": 3, "source": source, "source_sha256": source_sha, "source_rows": len(rows),
+        "schema_version": 4, "source": source, "source_sha256": source_sha, "source_rows": len(rows),
         "card_count": len(cards), "detail_count": len(details), "detail_type_counts": dict(type_counts),
         "cg_cards_loaded": len(cg_cards), "cg_attacks_loaded": len(cg_attacks), "corrections": corrections,
         "source_column_contract": {
             "Card ID": "card identity, ordering, mapping; metadata only", "Card Name": "card identity feature and metadata",
             "Expansion": "metadata", "Collection No.": "metadata", "Stage (Pokémon)/Type (Energy and Trainer)": "category/stage/subtype",
             "Rule": "rule flags", "Category": "card tags", "Previous stage": "evolves_from/evolves_to",
-            "HP": "raw/normalized/presence/applicability", "Type": "pokemon type or provided energy",
+            "HP": "raw/normalized/presence/applicability", "Type": "pokemon type or structured provided-energy profile",
             "Weakness": "weakness type", "Resistance (Type)": "resistance type", "Retreat": "raw/normalized/presence",
             "Move Name": "detail name feature, detail classification, CG alignment, and source metadata", "Cost": "12-dimensional energy counts",
             "Damage": "raw/base/mode/presence", "Effect Explanation": "detail text",

@@ -282,26 +282,43 @@ def import_mounted_daily_replay_dataset(
     controlled_agents: set[int] | None = None,
     max_samples: int | None = None,
 ) -> tuple[ReplayDecisionDataset, dict[str, Any]]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dataset = ReplayDecisionDataset.from_paths(
-        daily_replay_dirs,
+    replay_paths, metadata = prepare_mounted_daily_replays(daily_replay_dirs, output_dir)
+    dataset = ReplayDecisionDataset(
+        replay_paths,
         include_no_select=include_no_select,
         controlled_agents=controlled_agents,
         max_samples=max_samples,
     )
+    metadata.update(
+        {
+            "include_no_select": include_no_select,
+            "controlled_agents": sorted(controlled_agents) if controlled_agents is not None else None,
+            "max_samples": max_samples,
+        }
+    )
+    return dataset, metadata
+
+
+def prepare_mounted_daily_replays(
+    daily_replay_dirs: list[Path],
+    output_dir: Path,
+) -> tuple[list[Path], dict[str, Any]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from .replay_dataset import iter_replay_paths
+
+    replay_paths = iter_replay_paths(daily_replay_dirs)
     metadata = {
         "source": "mounted_daily_replay_dirs",
         "daily_replay_dirs": [str(path) for path in daily_replay_dirs],
-        "replay_paths": [str(path) for path in dataset.replay_paths],
-        "include_no_select": include_no_select,
-        "controlled_agents": sorted(controlled_agents) if controlled_agents is not None else None,
-        "max_samples": max_samples,
+        "replay_paths": [str(path) for path in replay_paths],
     }
-    (output_dir / "online_import_manifest.json").write_text(
+    reports_dir = output_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "online_import_manifest.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    return dataset, metadata
+    return replay_paths, metadata
 
 
 class KaggleReplayApiClient:
@@ -458,6 +475,27 @@ def import_online_replay_dataset(
     controlled_agents: set[int] | None = None,
     max_samples: int | None = None,
 ) -> tuple[ReplayDecisionDataset, dict[str, Any]]:
+    replay_paths, metadata = prepare_online_replays(config, client=client)
+    dataset = ReplayDecisionDataset(
+        replay_paths,
+        include_no_select=include_no_select,
+        controlled_agents=controlled_agents,
+        max_samples=max_samples,
+    )
+    metadata["config"].update(
+        {
+            "include_no_select": include_no_select,
+            "controlled_agents": sorted(controlled_agents) if controlled_agents is not None else None,
+            "max_samples": max_samples,
+        }
+    )
+    return dataset, metadata
+
+
+def prepare_online_replays(
+    config: OnlineReplayImportConfig,
+    client: ReplayApiClient | None = None,
+) -> tuple[list[Path], dict[str, Any]]:
     client = client or KaggleReplayApiClient()
     config.output_dir.mkdir(parents=True, exist_ok=True)
     refs = select_episode_refs(client, config)
@@ -475,19 +513,12 @@ def import_online_replay_dataset(
             "episodes_index_dir": str(config.episodes_index_dir) if config.episodes_index_dir is not None else None,
             "reserve_recent_days": config.reserve_recent_days,
             "import_split": config.import_split,
-            "include_no_select": include_no_select,
-            "controlled_agents": sorted(controlled_agents) if controlled_agents is not None else None,
-            "max_samples": max_samples,
         },
     }
-    (config.output_dir / "online_import_manifest.json").write_text(
+    reports_dir = config.output_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "online_import_manifest.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    dataset = ReplayDecisionDataset(
-        replay_paths,
-        include_no_select=include_no_select,
-        controlled_agents=controlled_agents,
-        max_samples=max_samples,
-    )
-    return dataset, metadata
+    return replay_paths, metadata
