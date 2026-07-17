@@ -72,6 +72,9 @@ class ReplayDecisionSample:
     observation_fingerprint: str | None = None
     action_semantics: ActionSemantics = ActionSemantics.SINGLE_INDEX
     action_target: LegalActionTarget | None = None
+    transition_observation_after: dict[str, Any] | None = None
+    transition_parsed_after: ParsedObservation | None = None
+    transition_memory_after: GameMemoryState | None = None
 
     @property
     def episode_key(self) -> str | None:
@@ -293,7 +296,7 @@ def iter_replay_paths(paths: Iterable[Path]) -> list[Path]:
             replay_paths.extend(sorted(path.rglob("*replay.json")))
             replay_paths.extend(sorted(path.rglob("*.json")))
             replay_paths.extend(sorted(path.rglob("*.jsonl")))
-        elif path.suffix.lower() in {".json", ".jsonl"}:
+        elif path.suffix.lower() in {".json", ".jsonl", ".zip"}:
             replay_paths.append(path)
     return sorted(dict.fromkeys(replay_paths))
 
@@ -310,13 +313,18 @@ class ReplayDecisionDataset:
         replay_paths: list[Path],
         controlled_agents: set[int] | None = None,
         max_samples: int | None = None,
+        max_replays: int | None = None,
+        archive_member_selection: str = "FIRST",
     ) -> None:
         self.replay_paths = replay_paths
         self.controlled_agents = controlled_agents
         self.samples: list[ReplayDecisionSample] = []
         self.summary = ReplayDatasetSummary()
+        if archive_member_selection not in {"FIRST", "EVENLY_SPACED"}:
+            raise ValueError("archive_member_selection must be FIRST or EVENLY_SPACED")
+        self.archive_member_selection = archive_member_selection
         self._seen_no_id_content_hashes: set[str] = set()
-        self._load(max_samples=max_samples)
+        self._load(max_samples=max_samples, max_replays=max_replays)
 
     @classmethod
     def from_paths(
@@ -324,12 +332,16 @@ class ReplayDecisionDataset:
         paths: Iterable[str | Path],
         controlled_agents: set[int] | None = None,
         max_samples: int | None = None,
+        max_replays: int | None = None,
+        archive_member_selection: str = "FIRST",
     ) -> "ReplayDecisionDataset":
         replay_paths = iter_replay_paths([Path(path) for path in paths])
         return cls(
             replay_paths,
             controlled_agents=controlled_agents,
             max_samples=max_samples,
+            max_replays=max_replays,
+            archive_member_selection=archive_member_selection,
         )
 
     def __len__(self) -> int:
@@ -338,10 +350,19 @@ class ReplayDecisionDataset:
     def __getitem__(self, index: int) -> ReplayDecisionSample:
         return self.samples[index]
 
-    def _load(self, max_samples: int | None) -> None:
+    def _load(self, max_samples: int | None, max_replays: int | None = None) -> None:
         for replay_path in self.replay_paths:
+            if max_replays is not None and self.summary.replay_count >= max_replays:
+                return
+            if replay_path.suffix.lower() == ".zip":
+                self._load_zip(replay_path, max_samples=max_samples, max_replays=max_replays)
+                if max_samples is not None and len(self.samples) >= max_samples:
+                    return
+                continue
             if replay_path.suffix.lower() == ".jsonl":
                 for replay, line_number, content_hash in self._load_jsonl(replay_path):
+                    if max_replays is not None and self.summary.replay_count >= max_replays:
+                        return
                     self._append_replay(
                         replay,
                         replay_path,
@@ -367,6 +388,67 @@ class ReplayDecisionDataset:
                 if max_samples is not None and len(self.samples) >= max_samples:
                     return
         self.summary.sample_count = len(self.samples)
+
+    def _load_zip(
+        self,
+        replay_path: Path,
+        *,
+        max_samples: int | None,
+        max_replays: int | None,
+    ) -> None:
+        try:
+            archive = zipfile.ZipFile(replay_path)
+        except (OSError, zipfile.BadZipFile) as exc:
+            self._record_error(
+                replay_path,
+                f"{type(exc).__name__}: {exc}",
+                stage="replay_load",
+            )
+            return
+        with archive:
+            members = sorted(
+                member
+                for member in archive.namelist()
+                if not member.endswith("/") and Path(member).suffix.lower() == ".json"
+            )
+            remaining = (
+                max_replays - self.summary.replay_count if max_replays is not None else None
+            )
+            if (
+                self.archive_member_selection == "EVENLY_SPACED"
+                and remaining is not None
+                and 0 < remaining < len(members)
+            ):
+                if remaining == 1:
+                    members = members[:1]
+                else:
+                    indices = [
+                        round(index * (len(members) - 1) / (remaining - 1))
+                        for index in range(remaining)
+                    ]
+                    members = [members[index] for index in indices]
+            for member in members:
+                if max_replays is not None and self.summary.replay_count >= max_replays:
+                    return
+                try:
+                    raw_replay = archive.read(member)
+                    replay = json.loads(raw_replay)
+                except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    self._record_error(
+                        replay_path,
+                        f"{type(exc).__name__}: {exc}; member={member}",
+                        stage="replay_load",
+                    )
+                    continue
+                self._append_replay(
+                    replay,
+                    replay_path,
+                    max_samples,
+                    source_archive_member=member,
+                    source_content_hash=hashlib.sha256(raw_replay).hexdigest(),
+                )
+                if max_samples is not None and len(self.samples) >= max_samples:
+                    return
 
     def _load_jsonl(
         self, replay_path: Path
@@ -441,7 +523,7 @@ class ReplayDecisionDataset:
         memories: dict[int, GameMemoryState] = {}
         pending: dict[int, _PendingDecision] = {}
         last_fingerprint: dict[int, str] = {}
-        source_date = replay_source_date(replay_path)
+        source_date = replay_source_date(source_archive_member or replay_path)
         replay_key = stable_replay_key(
             replay, replay_path, source_record_line, source_archive_member
         )
@@ -489,6 +571,7 @@ class ReplayDecisionDataset:
                         agent=agent_index,
                         line=source_record_line,
                     )
+                finalized_sample: ReplayDecisionSample | None = None
                 previous = pending.pop(agent_index, None)
                 if previous is not None and action is not None:
                     option_types = [_option_type(option) for option in previous.parsed.select_options]
@@ -530,8 +613,7 @@ class ReplayDecisionDataset:
                         self.summary.max_token_estimate = max(
                             self.summary.max_token_estimate, token_estimate
                         )
-                        self.samples.append(
-                            ReplayDecisionSample(
+                        finalized_sample = ReplayDecisionSample(
                             replay_key=replay_key,
                             replay_id=str(replay_id) if replay_id is not None else None,
                             episode_id=_int(episode_id, None),
@@ -559,12 +641,9 @@ class ReplayDecisionDataset:
                             observation_fingerprint=previous.fingerprint,
                             action_semantics=action_semantics,
                             action_target=action_target,
-                            )
                         )
+                        self.samples.append(finalized_sample)
                         self.summary.action_semantics_counts[action_semantics.value] += 1
-                        if max_samples is not None and len(self.samples) >= max_samples:
-                            self.summary.sample_count = len(self.samples)
-                            return
                 elif previous is not None:
                     # Invalid action payload: the pending state is consumed but no
                     # behavior-cloning label is fabricated.
@@ -624,6 +703,19 @@ class ReplayDecisionDataset:
                 fingerprint = observation_fingerprint(observation)
                 if last_fingerprint.get(agent_index) == fingerprint:
                     self.summary.duplicate_old_observations += 1
+                    if finalized_sample is not None:
+                        try:
+                            parsed_after = parse_observation(observation)
+                        except Exception:
+                            parsed_after = None
+                        finalized_sample.transition_observation_after = copy.deepcopy(observation)
+                        finalized_sample.transition_parsed_after = parsed_after
+                        finalized_sample.transition_memory_after = copy.deepcopy(
+                            memories.get(agent_index, GameMemoryState())
+                        )
+                    if max_samples is not None and len(self.samples) >= max_samples:
+                        self.summary.sample_count = len(self.samples)
+                        return
                     continue
                 last_fingerprint[agent_index] = fingerprint
                 try:
@@ -641,6 +733,13 @@ class ReplayDecisionDataset:
                 memory_before = copy.deepcopy(memory)
                 memory.update_from_parsed(parsed)
                 memory_after = copy.deepcopy(memory)
+                if finalized_sample is not None:
+                    finalized_sample.transition_observation_after = copy.deepcopy(observation)
+                    finalized_sample.transition_parsed_after = parsed
+                    finalized_sample.transition_memory_after = memory_after
+                if max_samples is not None and len(self.samples) >= max_samples:
+                    self.summary.sample_count = len(self.samples)
+                    return
                 if observation.get("select") is None:
                     self.summary.skipped_no_select += 1
                     continue

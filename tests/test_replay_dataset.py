@@ -46,6 +46,10 @@ def test_replay_decision_dataset_from_real_replay() -> None:
     assert first.option_count == len(first.parsed.select_options)
     assert len(first.parsed.card_instances) >= 0
     assert first.memory_after.max_recent_events == 32
+    assert first.transition_observation_after is not None
+    assert first.transition_parsed_after is not None
+    assert first.transition_memory_after is not None
+    assert first.action_step_index == first.step_index + 1
     batch = collate_replay_decisions([dataset[0], dataset[1]])
     assert len(batch["observations"]) == 2
     assert len(batch["metadata"]) == 2
@@ -264,6 +268,34 @@ def test_missing_episode_ids_ignore_zip_member_identity(tmp_path: Path) -> None:
     first = stable_replay_key(first_replay, archive, archive_member="a.json")
     second = stable_replay_key(second_replay, archive, archive_member="nested/b.json")
     assert first == second == f"content:{stable_replay_key(replay).split(':', 1)[1]}"
+
+
+def test_replay_dataset_streams_multiple_zip_members_with_provenance(tmp_path: Path) -> None:
+    archive = tmp_path / "replays.zip"
+    first = _minimal_replay(episode_id=1, replay_id="first")
+    second = _minimal_replay(episode_id=2, replay_id="second")
+    third = _minimal_replay(episode_id=3, replay_id="third")
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("2026-07-01-1.json", json.dumps(first))
+        handle.writestr("2026-07-02-2.json", json.dumps(second))
+        handle.writestr("2026-07-03-3.json", json.dumps(third))
+    dataset = ReplayDecisionDataset.from_paths([archive], max_replays=2)
+    assert len(dataset) == 2
+    assert dataset.summary.replay_count == 2
+    assert {sample.source_kind for sample in dataset.samples} == {"ZIP_MEMBER"}
+    assert {sample.source_archive_member for sample in dataset.samples} == {
+        "2026-07-01-1.json",
+        "2026-07-02-2.json",
+    }
+    assert {sample.source_date for sample in dataset.samples} == {"2026-07-01", "2026-07-02"}
+    assert ReplayDecisionDataset.from_paths([archive], max_replays=1).summary.replay_count == 1
+    evenly_spaced = ReplayDecisionDataset.from_paths(
+        [archive], max_replays=2, archive_member_selection="EVENLY_SPACED"
+    )
+    assert {sample.source_archive_member for sample in evenly_spaced.samples} == {
+        "2026-07-01-1.json",
+        "2026-07-03-3.json",
+    }
 
 
 def test_content_replay_key_survives_move_and_changes_with_content(tmp_path: Path) -> None:
