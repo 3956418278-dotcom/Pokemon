@@ -1,12 +1,12 @@
 [project]
-name = "pokemon-tcg-ai-agent"
+name = "pokemon-tcg-fixed-deck-selfplay"
 version = "0.1.0"
-description = "Replay, dynamic-state, and policy research for the Pokemon TCG AI Battle Challenge"
+description = "Fixed-deck self-play for the Pokemon TCG AI Battle Challenge"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 dependencies = [
-    "pandas>=2.0",
+    "PyYAML>=6.0",
     "torch>=2.1",
 ]
 

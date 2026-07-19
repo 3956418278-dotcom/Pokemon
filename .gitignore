@@ -13,20 +13,16 @@ __pycache__/
 *.local
 .kaggle/
 
-# Generated training artifacts and local outputs
+# Generated training and evaluation data
 artifacts/
 outputs/
-data_from_submission/replay_audit/
-data_from_submission/replay_dataset/
 checkpoints/
 logs/
 runs/
 wandb/
+replays/
+data_from_submission/
 *.patch
-static_card/outputs/
-static_card/artifacts/
-static_card/checkpoints/
-static_card/logs/
 *.pt
 *.pth
 *.ckpt
@@ -34,19 +30,10 @@ static_card/logs/
 *.npz
 *.parquet
 
-# Kaggle / competition downloads and extracted runtimes
+# Competition downloads and generated simulator runtime
 pokemon-tcg-ai-battle.zip
 cri_rulebook_en.pdf
 kaggle/datasets/cg_runtime/cg/
-
-# Generated or duplicated self-contained kernel source snapshots
-kaggle/datasets/dynamic_code/data/
-kaggle/datasets/dynamic_code/models/
-kaggle/datasets/dynamic_code/training/
-kaggle/datasets/dynamic_code/scripts/
-kaggle/datasets/dynamic_code/configs/
-kaggle/datasets/dynamic_code/tests/
-kaggle/datasets/dynamic_code/source_manifest.json
 
 # Collaboration/local agent state
 .agents/
