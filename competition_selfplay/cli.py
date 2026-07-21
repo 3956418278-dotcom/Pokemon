@@ -7,6 +7,7 @@ from pathlib import Path
 from .config import load_config
 from .deck import load_target_deck
 from .league import EvaluationResult, LeagueController, LeagueState
+from .semantic import SEMANTIC_CONCEPT_NAMES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,8 +32,11 @@ def dry_run(config_path: Path) -> dict[str, object]:
         "unique_card_count": len(set(deck.card_ids)),
         "deck_sha256": deck.sha256,
         "source_submission_ref": config.target_deck.source_submission_ref,
-        "reward_dimensions": ["outcome", "prize_progress", "setup_tempo"],
+        "reward": "terminal_outcome_plus_calibrated_semantic_potential_delta",
+        "semantic_concepts": list(SEMANTIC_CONCEPT_NAMES),
         "value_dimensions": config.model.value_dimensions,
+        "phase_a_games": config.reward.phase_a_games,
+        "phase_b_calibration_gated": True,
         "simulated_league_action": decision.action.value,
         "passed": decision.state.frozen_opponent_revision == trained.learner_revision,
     }

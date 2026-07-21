@@ -1,4 +1,4 @@
-schema_version: fixed_deck_selfplay_v1
+schema_version: transactional_semantic_selfplay_v2
 
 target_deck:
   source: decks/baseline_decks.json
@@ -12,23 +12,24 @@ model:
   copy_embedding_dim: 16
   instance_embedding_dim: 16
   hidden_dim: 128
-  value_dimensions: 3
+  observation_dimensions: 128
+  option_dimensions: 32
+  semantic_spline_knots: 5
+  value_dimensions: 1
 
 reward:
-  # Actor scalarization only. The critic retains all three targets separately.
-  actor_weights: [1.0, 0.25, 0.10]
-  win: 1.0
-  loss: -1.0
-  draw: 0.0
-  opponent_deck_out_win: 0.0
-  self_deck_out_loss: -1.25
-  prize_scale: 0.1666666667
-  own_active_weight: 0.20
-  own_bench_weight: 0.05
-  own_energy_weight: 0.10
-  opponent_active_weight: -0.05
-  opponent_bench_weight: -0.01
-  setup_delta_clip: 0.50
+  terminal_win: 1.0
+  terminal_loss: -1.0
+  terminal_draw: 0.0
+  max_shaping_alpha: 0.15
+  potential_clip: 0.8
+  target_ema_tau: 0.01
+  phase_a_games: 20000
+  phase_b_ramp_games: 50000
+  calibration_brier_improvement: 0.15
+  calibration_ece_max: 0.10
+  calibration_antisymmetry_max: 0.08
+  calibration_ranking_min: 0.60
 
 promotion:
   win_rate_threshold: 0.58
@@ -45,16 +46,19 @@ training:
   train_steps_per_iteration: 65536
   rollout_episodes: 512
   learning_rate: 0.00025
-  gamma: 0.995
+  gamma: 0.997
   gae_lambda: 0.95
   update_epochs: 4
   minibatch_size: 256
-  clip_epsilon: 0.15
-  value_clip_epsilon: 0.20
-  entropy_coefficient: 0.015
+  clip_epsilon: 0.20
+  entropy_coefficient: 0.01
   value_coefficient: 0.50
+  concept_coefficient: 1.0
+  semantic_value_coefficient: 0.50
+  residual_value_coefficient: 0.50
   max_grad_norm: 0.50
   target_kl: 0.02
+  normalize_advantage: true
   checkpoint_root: outputs/competition_selfplay/checkpoints
   rollout_root: outputs/competition_selfplay/rollouts
   metrics_root: outputs/competition_selfplay/metrics

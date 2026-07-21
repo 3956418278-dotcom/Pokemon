@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Iterable, Sequence
+
+import torch
+from torch import Tensor
 
 from .config import RewardConfig
+from .transactions import Transaction
 
 
 class TerminalReason(IntEnum):
@@ -14,77 +19,160 @@ class TerminalReason(IntEnum):
 
 
 @dataclass(frozen=True)
-class BattleSnapshot:
-    """Minimal shaping state; deck and hand counts are intentionally absent."""
+class TransactionReward:
+    terminal_outcome: float
+    shaping: float
 
-    turn: int
-    self_prize_count: int
-    opponent_prize_count: int
-    self_active_count: int
-    self_bench_count: int
-    self_attached_energy_count: int
-    opponent_active_count: int
-    opponent_bench_count: int
+    @property
+    def total(self) -> float:
+        return self.terminal_outcome + self.shaping
 
 
-@dataclass(frozen=True)
-class RewardVector:
-    """[terminal outcome, prize race, setup tempo]."""
+def perspective_outcome(
+    *,
+    perspective_player: int,
+    winner: int | None,
+    config: RewardConfig,
+) -> float:
+    if perspective_player not in (0, 1):
+        raise ValueError("perspective_player must be 0 or 1")
+    if winner is None:
+        return 0.0
+    if winner == 2:
+        return config.terminal_draw
+    if winner not in (0, 1):
+        raise ValueError("winner must be 0, 1, 2 (draw), or None")
+    return config.terminal_win if winner == perspective_player else config.terminal_loss
 
-    outcome: float
-    prize_progress: float
-    setup_tempo: float
 
-    def as_tuple(self) -> tuple[float, float, float]:
-        return (self.outcome, self.prize_progress, self.setup_tempo)
+def transaction_reward(
+    *,
+    terminal: bool,
+    outcome: float,
+    target_phi_before: float,
+    target_phi_after: float,
+    gamma: float,
+    shaping_alpha: float,
+    potential_clip: float = 0.8,
+) -> TransactionReward:
+    before = max(-potential_clip, min(potential_clip, float(target_phi_before)))
+    after = 0.0 if terminal else max(
+        -potential_clip, min(potential_clip, float(target_phi_after))
+    )
+    terminal_value = float(outcome) if terminal else 0.0
+    shaping = float(shaping_alpha) * (float(gamma) * after - before)
+    return TransactionReward(terminal_value, shaping)
 
-    def scalarize(self, weights: tuple[float, float, float]) -> float:
-        return sum(value * weight for value, weight in zip(self.as_tuple(), weights))
+
+def rewards_from_transactions(
+    transactions: Sequence[Transaction],
+    *,
+    gamma: float,
+    shaping_alpha: float,
+    potential_clip: float = 0.8,
+) -> Tensor:
+    rewards = [
+        transaction_reward(
+            terminal=transaction.terminal,
+            outcome=transaction.outcome,
+            target_phi_before=transaction.target_phi_before,
+            target_phi_after=transaction.target_phi_after,
+            gamma=gamma,
+            shaping_alpha=shaping_alpha,
+            potential_clip=potential_clip,
+        ).total
+        for transaction in transactions
+    ]
+    return torch.tensor(rewards, dtype=torch.float32)
 
 
-class VectorReward:
-    def __init__(self, config: RewardConfig) -> None:
-        self.config = config
+def transaction_gae(
+    rewards: Tensor | Sequence[float],
+    values: Tensor | Sequence[float],
+    terminals: Tensor | Sequence[bool],
+    *,
+    gamma: float,
+    gae_lambda: float,
+    next_values: Tensor | Sequence[float] | None = None,
+) -> tuple[Tensor, Tensor]:
+    """GAE over transaction steps. Nested simulator selects never appear here."""
 
-    def _setup_potential(self, state: BattleSnapshot) -> float:
-        cfg = self.config
-        return (
-            state.self_active_count * cfg.own_active_weight
-            + state.self_bench_count * cfg.own_bench_weight
-            + state.self_attached_energy_count * cfg.own_energy_weight
-            + state.opponent_active_count * cfg.opponent_active_weight
-            + state.opponent_bench_count * cfg.opponent_bench_weight
+    rewards_t = torch.as_tensor(rewards, dtype=torch.float32)
+    values_t = torch.as_tensor(values, dtype=torch.float32, device=rewards_t.device)
+    terminals_t = torch.as_tensor(terminals, dtype=torch.bool, device=rewards_t.device)
+    if rewards_t.ndim != 1 or values_t.shape != rewards_t.shape or terminals_t.shape != rewards_t.shape:
+        raise ValueError("rewards, values, and terminals must be equal-length vectors")
+    if next_values is None:
+        next_values_t = torch.cat((values_t[1:], values_t.new_zeros(1)))
+    else:
+        next_values_t = torch.as_tensor(next_values, dtype=torch.float32, device=rewards_t.device)
+        if next_values_t.shape != rewards_t.shape:
+            raise ValueError("next_values must match rewards")
+
+    advantages = torch.zeros_like(rewards_t)
+    running = rewards_t.new_zeros(())
+    for index in range(len(rewards_t) - 1, -1, -1):
+        continuation = (~terminals_t[index]).to(rewards_t.dtype)
+        delta = (
+            rewards_t[index]
+            + gamma * continuation * next_values_t[index]
+            - values_t[index]
         )
+        running = delta + gamma * gae_lambda * continuation * running
+        advantages[index] = running
+    return advantages, advantages + values_t
 
-    def transition(
-        self,
-        before: BattleSnapshot,
-        after: BattleSnapshot,
-        *,
-        perspective_player: int,
-        winner: int | None = None,
-        terminal_reason: TerminalReason | int | None = None,
-    ) -> RewardVector:
-        if perspective_player not in (0, 1):
-            raise ValueError("perspective_player must be 0 or 1")
-        cfg = self.config
-        prize_gain = before.opponent_prize_count - after.opponent_prize_count
-        prize_loss = before.self_prize_count - after.self_prize_count
-        prize_progress = (prize_gain - prize_loss) * cfg.prize_scale
-        setup_delta = self._setup_potential(after) - self._setup_potential(before)
-        setup_delta = max(-cfg.setup_delta_clip, min(cfg.setup_delta_clip, setup_delta))
 
-        outcome = 0.0
-        if winner is not None:
-            reason = TerminalReason(terminal_reason) if terminal_reason is not None else None
-            if winner == 2:
-                outcome = cfg.draw
-            elif winner == perspective_player:
-                # A win caused solely by the opponent failing to draw is not a
-                # learnable shaping target for this deck's own behaviour.
-                outcome = cfg.opponent_deck_out_win if reason is TerminalReason.DECK_OUT else cfg.win
-            else:
-                # Self deck-out is controllable enough to deserve its explicit
-                # penalty even though opponent deck remaining is never observed.
-                outcome = cfg.self_deck_out_loss if reason is TerminalReason.DECK_OUT else cfg.loss
-        return RewardVector(outcome, prize_progress, setup_delta)
+def discounted_outcome_returns(
+    transactions: Sequence[Transaction],
+    *,
+    gamma: float,
+) -> Tensor:
+    """Build the locked ``G_k = gamma**(K-1-k) * z`` target per seat."""
+
+    result = torch.zeros(len(transactions), dtype=torch.float32)
+    for seat in (0, 1):
+        segment: list[int] = []
+        for index, transaction in enumerate(transactions):
+            if transaction.seat != seat:
+                continue
+            segment.append(index)
+            if not transaction.terminal:
+                continue
+            terminal_utility = float(transaction.outcome)
+            count = len(segment)
+            for own_index, transaction_index in enumerate(segment):
+                result[transaction_index] = (
+                    gamma ** (count - 1 - own_index)
+                ) * terminal_utility
+            segment = []
+        if segment:
+            raise ValueError("each seat trajectory must end in a terminal transaction")
+    return result
+
+
+def mark_terminal_outcomes(
+    transactions: Iterable[Transaction],
+    *,
+    winner: int | None,
+    config: RewardConfig,
+) -> None:
+    """Close each seat's final temporal edge at the common terminal state."""
+
+    by_seat: dict[int, list[Transaction]] = {0: [], 1: []}
+    for transaction in transactions:
+        by_seat[transaction.seat].append(transaction)
+    for seat, seat_transactions in by_seat.items():
+        if not seat_transactions:
+            continue
+        for transaction in seat_transactions:
+            transaction.terminal = False
+            transaction.outcome = 0
+        final = seat_transactions[-1]
+        final.terminal = True
+        final.outcome = int(perspective_outcome(
+            perspective_player=seat,
+            winner=winner,
+            config=config,
+        ))
+        final.target_phi_after = 0.0

@@ -19,7 +19,7 @@ padding 和 unknown。该路线不依赖旧的全局静态卡牌特征产物。
 
 ## 分支内容
 
-- `competition_selfplay/`：固定套牌配置、奖励/晋升脚手架、机械 agent、打包、自对战和回放播放器；
+- `competition_selfplay/`：因果事务级 PPO、固定语义概念/校准门、league、机械 agent、打包与回放播放器；
 - `decks/`：目标牌组和基础牌组数据；
 - `kaggle/builders/cg_runtime/`：生成模拟器运行时的 Kaggle builder；
 - `scripts/make_baseline_decks.py`：从模拟器环境生成基础牌组；
@@ -30,12 +30,12 @@ padding 和 unknown。该路线不依赖旧的全局静态卡牌特征产物。
 
 ## 当前门槛
 
-机械策略和本地 replay 导出已经实现。训练循环采用 learner 对 frozen opponent 的非对称更新；
-learner 达到晋升阈值后，才把其参数复制给 frozen opponent。
-
-奖励函数尚未定稿。代码中现存的 `setup_tempo` 和对应权重只是早期连线脚手架，已经被否定，
-不得作为正式训练配置。已确认的方向是三维终局原因：对手无法维持 Active Pokémon、拿完奖励牌、
-以及自己 deck-out；不再设计粗粒度的统一“场面势能”。晋升阈值和训练轮数也仍是待校准参数。
+正式训练路径已替换为因果事务级 PPO。Phase A 前 20,000 个完整对局严格使用 `+1/-1/0`
+终局奖励，同时训练固定九维语义概念、校准语义势、残差值与标量 full critic；通过固定 holdout
+的 Brier、ECE、座位反对称和排序门后才进入 Phase B，并在 50,000 局内把语义势差系数升至
+0.15。每批只更新 learner；frozen opponent 仅随 league 晋升，完整 target semantic 路径仅在
+批次更新结束后做 EMA。实现和测试已具备开始 Phase A 的条件，但尚未声称 20,000 局训练或
+Phase B 校准已经完成。
 
 提交 `54825132` 及其 `audit-006` 对局已被明确排除为训练材料。当前机械候选必须先通过 replay
 人工抽检，详细状态见 `records/competition_selfplay/CURRENT.md`。

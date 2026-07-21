@@ -1,6 +1,42 @@
 # Current state — competition self-play
 
-Updated: 2026-07-19 (Asia/Shanghai)
+Updated: 2026-07-21 (Asia/Shanghai)
+
+## Transactional semantic PPO implementation
+
+- The obsolete `RewardVector(outcome, prize_progress, setup_tempo)`, `VectorReward`, actor
+  scalarization weights, setup-potential weights, and three-value critic contract have been removed.
+  Config schema is now `transactional_semantic_selfplay_v2`; the critic is scalar.
+- Rollout choices are assembled into causal transactions. Nested resolutions share one summed
+  non-forced log probability and one transaction advantage; unique forced choices are recorded but
+  excluded from the actor ratio.
+- Phase A is locked to 20,000 completed games of pure terminal `+1/-1/0` transaction-level PPO.
+  Concept, semantic-potential, residual, and full-value losses remain active while shaping alpha is
+  exactly zero.
+- The fixed nine-position semantic concept ensemble, deterministic applicability masks, automatic
+  completed-trajectory labels, serial-aware survival, delayed causal links, calibrated confidence,
+  bounded semantic potential, and reconstructable explanation interface are connected to training.
+- Phase B can begin only after the fixed holdout simultaneously passes the Brier-improvement, ECE,
+  seat-swap antisymmetry, and ranking gates. Alpha then ramps to 0.15 over 50,000 games.
+- During a rollout batch only the learner policy is updated. Learner seats alternate P0/P1; actor
+  loss excludes opponent transactions. The frozen opponent and the complete target semantic path
+  remain unchanged until, respectively, a league promotion or the explicit post-update EMA step.
+  Stored `target_phi_before/after` values make the collected batch reward invariant to online
+  encoder updates.
+- Checkpoints include learner/optimizer, scalar full-critic components, online semantic heads,
+  complete target semantic module, residual head, frozen opponent and revision, phase/game/alpha,
+  calibration metrics, league state, and config snapshot. Required metrics are emitted by the PPO
+  update/runner.
+- The implementation is code-ready for formal Phase A training. This means the full collection →
+  labeling → transaction reward/GAE → PPO → post-batch EMA → checkpoint path exists and is tested;
+  it does not claim that the 20,000-game Phase A run or the Phase B calibration gate has already
+  completed.
+- Verification on 2026-07-21: the maintained branch suite passes 61/61 tests. A no-output smoke
+  game against the official local `cg` runtime completed with 123 transactions, 164 non-forced
+  selects and 22 forced selects, preserved exact terminal reason `2`, produced labels and a compact
+  two-perspective holdout, and completed
+  one PPO update with all four critic losses. Opponent and target parameters stayed bitwise fixed
+  during that update; the target changed only after the explicit EMA boundary.
 
 ## Confirmed intake package
 
@@ -12,9 +48,9 @@ Updated: 2026-07-19 (Asia/Shanghai)
   replacements, all 19 Pokemon are Basic Pokemon.
 - Training contract: learner changes while opponent is frozen; promote and copy only above the
   threshold; freeze after repeated failed evaluations or the promotion cap.
-- Reward contract agreed with the user: three terminal-reason dimensions (opponent cannot maintain
-  an Active Pokémon, Prize cards exhausted, self deck-out). The existing provisional
-  `setup_tempo` implementation is obsolete and still needs replacement before RL training.
+- Reward contract: scalar terminal outcome plus a calibration-gated frozen semantic potential
+  difference. The earlier three-dimensional/setup prototype is historical and no longer exists in
+  the executable path.
 - Feature boundary: Card ID plus deck-copy/live-instance identity; no opponent deck/hand/discard
   counts; public opponent field counts remain allowed.
 
@@ -88,9 +124,10 @@ durable collaboration state belongs in this record.
 
 ## Next gate
 
-Human-inspect `audit-20260719-008` with the local animator against the mechanical contract. Do not
+For the independent mechanical fallback, human-inspect `audit-20260719-008` with the local animator
+against the mechanical contract. Do not
 use submission `54825132`, `audit-006`, or their games as training material. Do not rebuild/upload a
 new archive until the corrected local replay decisions pass that inspection. Any further policy
 revision should be driven by a concrete failed decision and its key-card state. After the mechanical
-backup stabilizes, use it as a fixed opponent/teacher while wiring simulator rollouts and the
-three-dimensional terminal critic.
+backup stabilizes, keep that acceptance decision separate from semantic self-play: formal Phase A
+can use the frozen learned snapshot path and must not ingest rejected mechanical games.
