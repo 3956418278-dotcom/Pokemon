@@ -1,0 +1,80 @@
+data:
+  replay_paths:
+    - outputs/replay_extract/replays/replays.zip
+  replay_index_path: outputs/replay_extract/replays/replay_index.csv
+  card_vocab_path: static_card/artifacts/card_data/card_id_to_index.json
+  action_contract_path: decision_agent_v1/contracts/action_semantics.json
+  output_root: outputs/decision_agent_v1
+
+split:
+  train_dates:
+    - 2026-07-01
+    - 2026-07-02
+    - 2026-07-03
+    - 2026-07-04
+    - 2026-07-05
+    - 2026-07-06
+    - 2026-07-07
+    - 2026-07-08
+    - 2026-07-09
+    - 2026-07-10
+    - 2026-07-11
+    - 2026-07-12
+    - 2026-07-13
+  validation_dates:
+    - 2026-07-14
+  test_dates:
+    - 2026-07-15
+
+limits:
+  max_episodes: null
+  max_decisions: null
+
+cache:
+  schema_version: policy_value_cache_v1
+  episodes_per_shard: 16
+  workers: 8
+  scales:
+    small:
+      train_episodes: 16
+      validation_episodes: 8
+      test_episodes: 8
+    medium:
+      train_episodes: 256
+      validation_episodes: 64
+      test_episodes: 64
+    full:
+      train_episodes: null
+      validation_episodes: null
+      test_episodes: null
+
+model:
+  card_id_embedding_dim: 128
+  model_dim: 128
+  dynamic_hidden_dim: 64
+  board_layers: 2
+  board_heads: 4
+  board_ffn_dim: 256
+  dropout: 0.1
+
+training:
+  batch_size: 512
+  learning_rate: 0.0003
+  epochs: 20
+  policy_loss_weight: 1.0
+  value_loss_weight: 0.5
+  episode_balance_value: true
+  episode_balance_policy: false
+  seed: 20260718
+  device: cpu
+  weight_decay: 0.01
+  gradient_clip_norm: 1.0
+  warmup_ratio: 0.05
+  scheduler: cosine
+  mixed_precision: false
+  early_stopping_patience: 3
+  value_class_weighting: true
+  joint_score_value_alpha: 0.25
+  winner_loser_outcome_weighting: false
+  agent_quality_weighting: false
+  decision_context_weighting: false

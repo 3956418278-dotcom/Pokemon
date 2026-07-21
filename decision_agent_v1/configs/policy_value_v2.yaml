@@ -1,0 +1,45 @@
+data:
+  replay_paths:
+    - outputs/replay_extract/replays/replays.zip
+  replay_index_path: outputs/replay_extract/replays/replay_index.csv
+  card_vocab_path: static_card/artifacts/card_data/card_id_to_index.json
+  action_contract_path: decision_agent_v1/contracts/action_semantics.json
+  output_root: outputs/decision_agent_v1
+  belief_output_dir: outputs/decision_agent_v1/belief
+  base_cache_dir: outputs/decision_agent_v1/cache/policy_value_v1_bdce7a0be6f9/full
+  base_checkpoint: outputs/decision_agent_v1/checkpoints/best_joint.pt
+
+split:
+  train_dates: [2026-07-01, 2026-07-02, 2026-07-03, 2026-07-04, 2026-07-05, 2026-07-06, 2026-07-07, 2026-07-08, 2026-07-09, 2026-07-10, 2026-07-11, 2026-07-12, 2026-07-13]
+  validation_dates: [2026-07-14]
+  test_dates: [2026-07-15]
+
+cache:
+  schema_version: policy_value_cache_v2_overlay
+  workers: 8
+
+state_upgrade:
+  recent_event_count: 16
+  max_templates: 64
+  archetype_loss_weight: 0.05
+  next_public_loss_weight: 0.05
+
+model:
+  model_dim: 128
+  dynamic_hidden_dim: 64
+  board_layers: 2
+  board_heads: 4
+  board_ffn_dim: 256
+  dropout: 0.1
+
+training:
+  batch_size: 384
+  learning_rate: 0.0001
+  epochs: 2
+  policy_loss_weight: 1.0
+  value_loss_weight: 0.5
+  seed: 20260718
+  device: cuda
+  weight_decay: 0.01
+  gradient_clip_norm: 1.0
+  mixed_precision: false

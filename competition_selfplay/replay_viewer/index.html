@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PTCG Replay 人工抽检</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">MECHANICAL AGENT AUDIT</p>
+      <h1>PTCG Replay 人工抽检</h1>
+    </div>
+    <label class="file-button">
+      加载 replay JSON
+      <input id="fileInput" type="file" accept="application/json,.json">
+    </label>
+  </header>
+
+  <main id="dropZone">
+    <section class="status-strip">
+      <div><span>文件</span><strong id="fileName">尚未加载</strong></div>
+      <div><span>回合</span><strong id="turnLabel">—</strong></div>
+      <div><span>帧</span><strong id="frameLabel">0 / 0</strong></div>
+      <div><span>结果</span><strong id="resultLabel">—</strong></div>
+    </section>
+
+    <section class="board" aria-label="对局场面">
+      <article class="player-panel opponent" id="player0"></article>
+      <div class="stadium-row">
+        <span>STADIUM</span>
+        <div id="stadium"></div>
+      </div>
+      <article class="player-panel self" id="player1"></article>
+    </section>
+
+    <section class="timeline-panel">
+      <div class="controls">
+        <button id="firstButton" title="第一帧">|◀</button>
+        <button id="prevButton" title="上一帧">◀</button>
+        <button id="playButton" class="primary" title="播放/暂停">播放</button>
+        <button id="nextButton" title="下一帧">▶</button>
+        <button id="lastButton" title="最后一帧">▶|</button>
+        <label>速度
+          <select id="speedSelect">
+            <option value="1400">0.7×</option>
+            <option value="900" selected>1×</option>
+            <option value="500">2×</option>
+            <option value="250">4×</option>
+          </select>
+        </label>
+      </div>
+      <input id="timeline" type="range" min="0" max="0" value="0">
+      <div class="keyboard-help">空格：播放/暂停　←/→：逐帧　Shift + ←/→：跳10帧</div>
+    </section>
+
+    <section class="audit-grid">
+      <article>
+        <h2>当前选择</h2>
+        <div id="selection" class="detail-box">加载 JSON 后显示。</div>
+      </article>
+      <article>
+        <h2>本帧日志</h2>
+        <div id="logs" class="detail-box">加载 JSON 后显示。</div>
+      </article>
+    </section>
+
+    <section id="emptyState" class="empty-state">
+      <strong>拖入 Kaggle replay JSON，或点击右上角选择文件</strong>
+      <span>查看器读取 replay 中的 visualize.current，不会上传文件。</span>
+    </section>
+  </main>
+
+  <template id="cardTemplate">
+    <div class="card">
+      <div class="card-head"><strong></strong><span class="serial"></span></div>
+      <div class="hp"></div>
+      <div class="energy-list"></div>
+    </div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -46,10 +46,16 @@ class GameMemoryState:
     max_recent_events: int = MAX_RECENT_EVENTS
     observation_count: int = 0
     anonymous_zone_transitions: dict[int, dict[str, int]] = field(default_factory=dict)
+    cumulative_public_event_counts: dict[int, int] = field(default_factory=dict)
+    current_turn_public_event_counts: dict[int, int] = field(default_factory=dict)
+    event_counter_turn: int | None = None
 
     def update_from_parsed(self, parsed: ParsedObservation) -> "GameMemoryState":
         self.observation_count += 1
         turn = parsed.global_snapshot.turn
+        if self.event_counter_turn != turn:
+            self.current_turn_public_event_counts.clear()
+            self.event_counter_turn = turn
         for event in self.recent_events:
             event.observation_age += 1
             event.turn_age = max(0, turn - event.observed_at_turn)
@@ -113,6 +119,13 @@ class GameMemoryState:
         return memory
 
     def _apply_event(self, event: GameEvent, turn: int) -> None:
+        if 0 <= event.event_type < 24:
+            self.cumulative_public_event_counts[event.event_type] = (
+                self.cumulative_public_event_counts.get(event.event_type, 0) + 1
+            )
+            self.current_turn_public_event_counts[event.event_type] = (
+                self.current_turn_public_event_counts.get(event.event_type, 0) + 1
+            )
         if event.card_id is None and event.player_index is not None:
             zone_names = {1: "deck", 2: "hand", 6: "prize"}
             quantity = event.raw.get("quantity", 1)

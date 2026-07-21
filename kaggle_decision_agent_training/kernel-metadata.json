@@ -1,0 +1,33 @@
+{
+  "id": "f7e6n5g4/ptcg-decision-agent-v1-train",
+  "title": "ptcg-decision-agent-v1-train",
+  "code_file": "run_training.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "machine_shape": "",
+  "dataset_sources": [
+    "f7e6n5g4/ptcg-decision-agent-v1-code",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-01",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-02",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-03",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-04",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-05",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-06",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-07",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-08",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-09",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-10",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-11",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-12",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-13",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-14",
+    "kaggle/pokemon-tcg-ai-battle-episodes-2026-07-15"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

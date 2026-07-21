@@ -1,0 +1,61 @@
+schema_version: fixed_deck_selfplay_v1
+
+target_deck:
+  source: decks/baseline_decks.json
+  index: 6
+  expected_name: Raging Bolt Ogerpon
+  expected_deck_sha256: 1134964e85e85978ae1c6ea5a8234fee166ce787f38285bbbf2462d406a4bada
+  card_vocab_path: static_card/artifacts/card_data/card_id_to_index.json
+  source_submission_ref: 54815037
+
+model:
+  card_embedding_dim: 128
+  copy_embedding_dim: 16
+  instance_embedding_dim: 16
+  hidden_dim: 128
+  value_dimensions: 3
+
+reward:
+  # Actor scalarization only. The critic retains all three targets separately.
+  actor_weights: [1.0, 0.25, 0.10]
+  win: 1.0
+  loss: -1.0
+  draw: 0.0
+  opponent_deck_out_win: 0.0
+  self_deck_out_loss: -1.25
+  prize_scale: 0.1666666667
+  own_active_weight: 0.20
+  own_bench_weight: 0.05
+  own_energy_weight: 0.10
+  opponent_active_weight: -0.05
+  opponent_bench_weight: -0.01
+  setup_delta_clip: 0.50
+
+promotion:
+  win_rate_threshold: 0.58
+  evaluation_games: 256
+  minimum_games: 128
+  draws_as_half_win: true
+  alternate_seats: true
+  max_promotions: 12
+  max_evaluations_without_promotion: 6
+
+training:
+  seed: 20260719
+  device: cuda
+  train_steps_per_iteration: 65536
+  rollout_episodes: 512
+  learning_rate: 0.00025
+  gamma: 0.995
+  gae_lambda: 0.95
+  update_epochs: 4
+  minibatch_size: 256
+  clip_epsilon: 0.15
+  value_clip_epsilon: 0.20
+  entropy_coefficient: 0.015
+  value_coefficient: 0.50
+  max_grad_norm: 0.50
+  target_kl: 0.02
+  checkpoint_root: outputs/competition_selfplay/checkpoints
+  rollout_root: outputs/competition_selfplay/rollouts
+  metrics_root: outputs/competition_selfplay/metrics
