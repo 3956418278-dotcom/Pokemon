@@ -8,7 +8,6 @@ from torch import Tensor
 
 from .config import RewardConfig
 from .semantic import BINARY_CONCEPT_INDICES
-from .semantic import CONTINUOUS_CONCEPT_INDICES
 
 
 class TrainingPhase(str, Enum):
@@ -18,21 +17,25 @@ class TrainingPhase(str, Enum):
 
 @dataclass(frozen=True)
 class CalibrationMetrics:
-    brier_score: float
-    constant_prior_brier: float
-    brier_improvement: float
-    ece: float
-    antisymmetry_error: float
-    ranking_accuracy: float
+    concept_brier_score: float
+    concept_constant_prior_brier: float
+    concept_brier_improvement: float
+    concept_ece: float
+    semantic_antisymmetry_error: float
+    semantic_ranking_accuracy: float
+    full_antisymmetry_error: float
+    full_ranking_accuracy: float
 
     def as_dict(self) -> dict[str, float]:
         return {
-            "semantic_brier": self.brier_score,
-            "semantic_constant_prior_brier": self.constant_prior_brier,
-            "semantic_brier_improvement": self.brier_improvement,
-            "semantic_ece": self.ece,
-            "semantic_antisymmetry_error": self.antisymmetry_error,
-            "semantic_ranking_accuracy": self.ranking_accuracy,
+            "concept_brier_score": self.concept_brier_score,
+            "concept_constant_prior_brier": self.concept_constant_prior_brier,
+            "concept_brier_improvement": self.concept_brier_improvement,
+            "concept_ece": self.concept_ece,
+            "semantic_antisymmetry_error": self.semantic_antisymmetry_error,
+            "semantic_ranking_accuracy": self.semantic_ranking_accuracy,
+            "full_antisymmetry_error": self.full_antisymmetry_error,
+            "full_ranking_accuracy": self.full_ranking_accuracy,
         }
 
 
@@ -107,10 +110,11 @@ def calibration_metrics(
     concept_predictions: Tensor,
     concept_targets: Tensor,
     applicable: Tensor,
+    semantic_values: Tensor,
     full_values: Tensor,
     outcome_returns: Tensor,
+    swapped_semantic_values: Tensor,
     swapped_full_values: Tensor,
-    swapped_concept_predictions: Tensor | None = None,
     prior_probabilities: Tensor | None = None,
 ) -> CalibrationMetrics:
     probabilities, targets, _ = _masked_binary_values(
@@ -153,32 +157,36 @@ def calibration_metrics(
         prior_brier = float(((prior - targets) ** 2).mean().cpu())
         improvement = (prior_brier - brier) / max(prior_brier, 1e-12)
         ece = expected_calibration_error(probabilities, targets)
-    full = full_values.detach().flatten().float()
-    swapped = swapped_full_values.detach().flatten().float()
-    if full.shape != swapped.shape:
-        raise ValueError("seat-swapped values must align one-to-one")
-    value_antisymmetry = (
-        float((full + swapped).abs().mean().cpu()) if full.numel() else float("inf")
+    semantic = semantic_values.detach().flatten().float()
+    swapped_semantic = swapped_semantic_values.detach().flatten().float()
+    if semantic.shape != swapped_semantic.shape:
+        raise ValueError("seat-swapped semantic values must align one-to-one")
+    semantic_antisymmetry = (
+        float((semantic + swapped_semantic).abs().mean().cpu())
+        if semantic.numel()
+        else float("inf")
     )
-    if swapped_concept_predictions is None:
-        antisymmetry = value_antisymmetry
-    else:
-        prize_indices = list(CONTINUOUS_CONCEPT_INDICES)
-        original_prize = concept_predictions[..., prize_indices]
-        swapped_prize = swapped_concept_predictions[..., prize_indices]
-        if original_prize.shape != swapped_prize.shape:
-            raise ValueError("seat-swapped concept predictions must align one-to-one")
-        concept_antisymmetry = float(
-            (original_prize + swapped_prize).abs().mean().detach().cpu()
-        )
-        antisymmetry = max(value_antisymmetry, concept_antisymmetry)
+    full = full_values.detach().flatten().float()
+    swapped_full = swapped_full_values.detach().flatten().float()
+    if full.shape != swapped_full.shape:
+        raise ValueError("seat-swapped full values must align one-to-one")
+    full_antisymmetry = (
+        float((full + swapped_full).abs().mean().cpu())
+        if full.numel()
+        else float("inf")
+    )
     return CalibrationMetrics(
-        brier_score=brier,
-        constant_prior_brier=prior_brier,
-        brier_improvement=improvement,
-        ece=ece,
-        antisymmetry_error=antisymmetry,
-        ranking_accuracy=value_ranking_accuracy(full_values, outcome_returns),
+        concept_brier_score=brier,
+        concept_constant_prior_brier=prior_brier,
+        concept_brier_improvement=improvement,
+        concept_ece=ece,
+        semantic_antisymmetry_error=semantic_antisymmetry,
+        semantic_ranking_accuracy=value_ranking_accuracy(
+            semantic_values,
+            outcome_returns,
+        ),
+        full_antisymmetry_error=full_antisymmetry,
+        full_ranking_accuracy=value_ranking_accuracy(full_values, outcome_returns),
     )
 
 
@@ -188,14 +196,20 @@ class CalibrationGate:
 
     def evaluate(self, metrics: CalibrationMetrics) -> CalibrationDecision:
         failures: list[str] = []
-        if metrics.brier_improvement < self.config.calibration_brier_improvement:
-            failures.append("brier_improvement")
-        if metrics.ece > self.config.calibration_ece_max:
-            failures.append("ece")
-        if metrics.antisymmetry_error > self.config.calibration_antisymmetry_max:
-            failures.append("antisymmetry")
-        if metrics.ranking_accuracy < self.config.calibration_ranking_min:
-            failures.append("ranking")
+        if (
+            metrics.concept_brier_improvement
+            < self.config.calibration_brier_improvement
+        ):
+            failures.append("concept_brier_improvement")
+        if metrics.concept_ece > self.config.calibration_ece_max:
+            failures.append("concept_ece")
+        if (
+            metrics.semantic_antisymmetry_error
+            > self.config.calibration_antisymmetry_max
+        ):
+            failures.append("semantic_antisymmetry")
+        if metrics.semantic_ranking_accuracy < self.config.calibration_ranking_min:
+            failures.append("semantic_ranking")
         return CalibrationDecision(passed=not failures, failures=tuple(failures))
 
 

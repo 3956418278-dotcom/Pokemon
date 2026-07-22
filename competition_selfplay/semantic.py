@@ -1,48 +1,53 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .transactions import Transaction, TransactionEvent
+from .transactions import (
+    Transaction,
+    TransactionEvent,
+    is_root_decision,
+    is_terminal_state,
+    state_turn,
+)
 
 
 SEMANTIC_CONCEPT_NAMES = (
-    "attack_available_next_own_turn",
-    "active_survival_to_next_own_turn",
-    "net_prize_gain_h1",
-    "net_prize_gain_h3",
-    "net_prize_gain_h6",
-    "self_deckout_risk_h6",
-    "rule_lock_persists_to_opponent_turn",
-    "recovery_path_realized_next_own_turn",
-    "armed_delayed_trigger_realized",
+    "self_attack_current_turn",
+    "opponent_attack_before_next_self_turn",
+    "self_attack_next_self_turn",
+    "net_prize_swing_current_turn",
+    "net_prize_swing_opponent_response",
+    "net_prize_swing_next_self_turn",
+    "net_prize_swing_self_turns_2_to_3",
+    "net_prize_swing_self_turns_4_to_6",
+    "terminal_reached_by_end_self_turn_6",
+    "terminal_utility_if_reached",
 )
-NUM_SEMANTIC_CONCEPTS = 9
+NUM_SEMANTIC_CONCEPTS = 10
 
-ATTACK_AVAILABLE = 0
-ACTIVE_SURVIVAL = 1
-NET_PRIZE_H1 = 2
-NET_PRIZE_H3 = 3
-NET_PRIZE_H6 = 4
-SELF_DECKOUT = 5
-RULE_LOCK = 6
-RECOVERY_PATH = 7
-DELAYED_TRIGGER = 8
+SELF_ATTACK_CURRENT = 0
+OPPONENT_ATTACK_RESPONSE = 1
+SELF_ATTACK_NEXT = 2
+PRIZE_CURRENT = 3
+PRIZE_OPPONENT_RESPONSE = 4
+PRIZE_NEXT_SELF = 5
+PRIZE_SELF_TURNS_2_TO_3 = 6
+PRIZE_SELF_TURNS_4_TO_6 = 7
+TERMINAL_REACHED_H6 = 8
+TERMINAL_UTILITY_H6 = 9
 
-BINARY_CONCEPT_INDICES = (0, 1, 5, 6, 7, 8)
-CONTINUOUS_CONCEPT_INDICES = (2, 3, 4)
+BINARY_CONCEPT_INDICES = (0, 1, 2, 8)
+CONTINUOUS_CONCEPT_INDICES = (3, 4, 5, 6, 7, 9)
 
 SEMANTIC_INTERACTIONS = (
-    (ATTACK_AVAILABLE, NET_PRIZE_H1),
-    (ACTIVE_SURVIVAL, NET_PRIZE_H3),
-    (RECOVERY_PATH, ACTIVE_SURVIVAL),
-    (RULE_LOCK, NET_PRIZE_H3),
-    (DELAYED_TRIGGER, NET_PRIZE_H3),
-    (SELF_DECKOUT, NET_PRIZE_H6),
+    (SELF_ATTACK_CURRENT, PRIZE_CURRENT),
+    (OPPONENT_ATTACK_RESPONSE, PRIZE_OPPONENT_RESPONSE),
+    (SELF_ATTACK_NEXT, PRIZE_NEXT_SELF),
 )
 
 
@@ -68,6 +73,40 @@ class SemanticPotentialExplanation:
     confidence_gate: float
     pre_tanh_logit: float
     potential: float
+
+
+@dataclass(frozen=True)
+class TurnGroup:
+    turn_id: int
+    owner_seat: int
+    transaction_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TransactionWindow:
+    transaction_indices: tuple[int, ...]
+    applicable: bool
+    start_state: Any = None
+    end_state: Any = None
+
+
+@dataclass(frozen=True)
+class SemanticTimeWindows:
+    current_turn: TransactionWindow
+    opponent_response: TransactionWindow
+    next_self_turn: TransactionWindow
+    self_turns_2_to_3: TransactionWindow
+    self_turns_4_to_6: TransactionWindow
+
+    @property
+    def prize_windows(self) -> tuple[TransactionWindow, ...]:
+        return (
+            self.current_turn,
+            self.opponent_response,
+            self.next_self_turn,
+            self.self_turns_2_to_3,
+            self.self_turns_4_to_6,
+        )
 
 
 @dataclass(frozen=True)
@@ -238,190 +277,340 @@ def semantic_state_facts(state: Mapping[str, Any] | None, seat: int) -> Semantic
 
 
 def semantic_applicability(state: Mapping[str, Any] | None, seat: int) -> Tensor:
-    facts = semantic_state_facts(state, seat)
-    mask = torch.ones(NUM_SEMANTIC_CONCEPTS, dtype=torch.bool)
-    mask[ACTIVE_SURVIVAL] = facts.active_serial is not None
-    mask[RULE_LOCK] = bool(facts.rule_lock_ids)
-    mask[RECOVERY_PATH] = facts.recovery_needed
-    mask[DELAYED_TRIGGER] = bool(facts.armed_delayed_effect_ids)
-    return mask
+    # All ten coordinates are structurally available to a live model state.
+    # Completed-trajectory supervision supplies the narrower temporal mask,
+    # including the conditional applicability of terminal utility.
+    semantic_state_facts(state, seat)
+    return torch.ones(NUM_SEMANTIC_CONCEPTS, dtype=torch.bool)
 
 
 def _event_kind(event: TransactionEvent) -> str:
     return event.kind.lower().replace("-", "_")
 
 
-def _has_event(transactions: Iterable[Transaction], kinds: set[str], *, seat: int) -> bool:
-    for transaction in transactions:
-        for event in transaction.event_records:
-            if event.seat not in (None, seat):
-                continue
-            if _event_kind(event) in kinds:
-                return True
-    return False
+def build_turn_groups(transactions: Sequence[Transaction]) -> tuple[TurnGroup, ...]:
+    """Group consecutive transactions by the real simulator turn field."""
+
+    groups: list[TurnGroup] = []
+    pending_turn: int | None = None
+    pending_indices: list[int] = []
+
+    def finish_pending() -> None:
+        if not pending_indices or pending_turn is None:
+            return
+        root = next(
+            (
+                transactions[index]
+                for index in pending_indices
+                if is_root_decision(transactions[index].start_state)
+            ),
+            transactions[pending_indices[0]],
+        )
+        groups.append(
+            TurnGroup(
+                turn_id=pending_turn,
+                owner_seat=root.seat,
+                transaction_indices=tuple(pending_indices),
+            )
+        )
+
+    for index, transaction in enumerate(transactions):
+        turn_id = state_turn(transaction.start_state)
+        if turn_id is None:
+            raise ValueError(
+                "complete training trajectory is missing current.turn at "
+                f"transaction {transaction.transaction_id}"
+            )
+        if pending_indices and turn_id != pending_turn:
+            finish_pending()
+            pending_indices = []
+        pending_turn = turn_id
+        pending_indices.append(index)
+    finish_pending()
+    return tuple(groups)
+
+
+class _TrajectoryTimeline:
+    def __init__(self, transactions: Sequence[Transaction]) -> None:
+        if not transactions:
+            raise ValueError("cannot label an empty trajectory")
+        self.transactions = transactions
+        self.groups = build_turn_groups(transactions)
+        self.group_position_by_transaction: dict[int, int] = {}
+        for group_position, group in enumerate(self.groups):
+            for transaction_index in group.transaction_indices:
+                self.group_position_by_transaction[transaction_index] = group_position
+
+        terminal_indices = [
+            index
+            for index, transaction in enumerate(transactions)
+            if is_terminal_state(transaction.end_state)
+        ]
+        if not terminal_indices:
+            terminal_indices = [
+                index
+                for index, transaction in enumerate(transactions)
+                if is_terminal_state(transaction.trajectory_terminal_state)
+            ]
+        if not terminal_indices:
+            terminal_indices = [
+                index
+                for index, transaction in enumerate(transactions)
+                if transaction.terminal
+            ]
+        if not terminal_indices:
+            raise ValueError("complete training trajectory has no terminal boundary")
+        self.terminal_index = max(terminal_indices)
+        if self.terminal_index != len(transactions) - 1:
+            raise ValueError("complete training trajectory contains transactions after terminal")
+        terminal_transaction = transactions[self.terminal_index]
+        if is_terminal_state(terminal_transaction.end_state):
+            self.terminal_state = terminal_transaction.end_state
+        else:
+            self.terminal_state = (
+                terminal_transaction.trajectory_terminal_state
+                or terminal_transaction.end_state
+            )
+        if self.terminal_state is None:
+            raise ValueError("terminal transaction has no terminal state")
+
+    def _state_after(self, transaction_index: int) -> Any:
+        if transaction_index == self.terminal_index:
+            return self.terminal_state
+        state = self.transactions[transaction_index].end_state
+        if state is None and transaction_index + 1 < len(self.transactions):
+            state = self.transactions[transaction_index + 1].start_state
+        if state is None:
+            raise ValueError(
+                "trajectory window has no end state at transaction "
+                f"{self.transactions[transaction_index].transaction_id}"
+            )
+        return state
+
+    def _window(
+        self,
+        start_index: int,
+        end_index: int,
+        *,
+        empty_after: int | None = None,
+    ) -> TransactionWindow:
+        if start_index > self.terminal_index:
+            return TransactionWindow((), False)
+        if end_index < start_index:
+            if empty_after is None:
+                return TransactionWindow((), False)
+            boundary = self._state_after(empty_after)
+            return TransactionWindow((), True, boundary, boundary)
+        bounded_end = min(end_index, self.terminal_index)
+        indices = tuple(range(start_index, bounded_end + 1))
+        start_state = self.transactions[start_index].start_state
+        if start_state is None:
+            raise ValueError(
+                "trajectory window has no start state at transaction "
+                f"{self.transactions[start_index].transaction_id}"
+            )
+        return TransactionWindow(
+            transaction_indices=indices,
+            applicable=True,
+            start_state=start_state,
+            end_state=self._state_after(bounded_end),
+        )
+
+    def windows(self, transaction_index: int) -> SemanticTimeWindows:
+        transaction = self.transactions[transaction_index]
+        seat = transaction.seat
+        group_position = self.group_position_by_transaction[transaction_index]
+        current_group = self.groups[group_position]
+        current_end = current_group.transaction_indices[-1]
+        future_self_groups = [
+            position
+            for position in range(group_position + 1, len(self.groups))
+            if self.groups[position].owner_seat == seat
+        ]
+
+        current = self._window(transaction_index, current_end)
+        response_start = current_end + 1
+        if future_self_groups:
+            next_self_start = self.groups[future_self_groups[0]].transaction_indices[0]
+            response = self._window(
+                response_start,
+                next_self_start - 1,
+                empty_after=current_end,
+            )
+            next_self_group = self.groups[future_self_groups[0]]
+            next_self = self._window(
+                next_self_group.transaction_indices[0],
+                next_self_group.transaction_indices[-1],
+            )
+            turns_2_to_3_end = (
+                self.groups[future_self_groups[2]].transaction_indices[-1]
+                if len(future_self_groups) >= 3
+                else self.terminal_index
+            )
+            turns_2_to_3 = self._window(
+                next_self_group.transaction_indices[-1] + 1,
+                turns_2_to_3_end,
+            )
+        else:
+            response = self._window(response_start, self.terminal_index)
+            next_self = TransactionWindow((), False)
+            turns_2_to_3 = TransactionWindow((), False)
+
+        if len(future_self_groups) >= 3:
+            third_self_end = self.groups[future_self_groups[2]].transaction_indices[-1]
+            turns_4_to_6_end = (
+                self.groups[future_self_groups[5]].transaction_indices[-1]
+                if len(future_self_groups) >= 6
+                else self.terminal_index
+            )
+            turns_4_to_6 = self._window(third_self_end + 1, turns_4_to_6_end)
+        else:
+            turns_4_to_6 = TransactionWindow((), False)
+
+        return SemanticTimeWindows(
+            current_turn=current,
+            opponent_response=response,
+            next_self_turn=next_self,
+            self_turns_2_to_3=turns_2_to_3,
+            self_turns_4_to_6=turns_4_to_6,
+        )
+
+    def terminal_reached_h6(self, transaction_index: int) -> bool:
+        seat = self.transactions[transaction_index].seat
+        group_position = self.group_position_by_transaction[transaction_index]
+        future_self_groups = [
+            position
+            for position in range(group_position + 1, len(self.groups))
+            if self.groups[position].owner_seat == seat
+        ]
+        if len(future_self_groups) < 6:
+            return True
+        sixth_self_end = self.groups[future_self_groups[5]].transaction_indices[-1]
+        return self.terminal_index <= sixth_self_end
+
+    def terminal_utility(self, seat: int) -> float:
+        current = (
+            self.terminal_state.get("current") or {}
+            if isinstance(self.terminal_state, Mapping)
+            else {}
+        )
+        winner = _as_int(current.get("result"))
+        if winner in (0, 1, 2):
+            if winner == 2:
+                return 0.0
+            return 1.0 if winner == seat else -1.0
+        seat_terminals = [
+            transaction
+            for transaction in self.transactions
+            if transaction.seat == seat and transaction.terminal
+        ]
+        if not seat_terminals or seat_terminals[-1].outcome not in (-1, 0, 1):
+            raise ValueError("terminal trajectory has no valid seat-relative utility")
+        return float(seat_terminals[-1].outcome)
 
 
 class TrajectoryLabelBuilder:
-    """Build all concept targets by looking back over a completed game."""
+    """Build the fixed ten concepts from a completed transactional game."""
 
-    ATTACK_KINDS = {"attack", "attack_executed", "15"}
-    DECKOUT_KINDS = {"self_deckout", "deck_out", "deckout"}
-    RECOVERY_KINDS = {"recovery_path_realized", "recovery_realized"}
-    DELAYED_KINDS = {"delayed_trigger", "armed_delayed_trigger_realized"}
+    ATTACK_KINDS = {"attack_executed", "15"}
+
+    @staticmethod
+    def time_windows(
+        transactions: Sequence[Transaction],
+        index: int,
+    ) -> SemanticTimeWindows:
+        return _TrajectoryTimeline(transactions).windows(index)
 
     def build(self, transactions: Sequence[Transaction]) -> SemanticConceptTargets:
+        timeline = _TrajectoryTimeline(transactions)
         values = torch.zeros((len(transactions), NUM_SEMANTIC_CONCEPTS), dtype=torch.float32)
         applicable = torch.zeros_like(values, dtype=torch.bool)
         for index, transaction in enumerate(transactions):
-            mask = semantic_applicability(transaction.start_state, transaction.seat)
+            result, mask = self._build_one(timeline, index)
+            values[index] = result
             applicable[index] = mask
-            values[index] = self._build_one(transactions, index)
             transaction.semantic_target_values = values[index].clone()
             transaction.semantic_target_applicable = mask.clone()
             if transaction.semantic_applicable is None:
-                transaction.semantic_applicable = mask.clone()
+                transaction.semantic_applicable = semantic_applicability(
+                    transaction.start_state,
+                    transaction.seat,
+                )
+            elif transaction.semantic_applicable.shape != (NUM_SEMANTIC_CONCEPTS,):
+                raise ValueError(
+                    "transaction semantic applicability does not match the v3 "
+                    "ten-dimensional schema"
+                )
         return SemanticConceptTargets(values=values, applicable=applicable)
 
-    def _build_one(self, transactions: Sequence[Transaction], index: int) -> Tensor:
-        transaction = transactions[index]
-        seat = transaction.seat
-        start = semantic_state_facts(transaction.start_state, seat)
-        own_indices = [
-            candidate
-            for candidate in range(index, len(transactions))
-            if transactions[candidate].seat == seat
-        ]
-        result = torch.zeros(NUM_SEMANTIC_CONCEPTS, dtype=torch.float32)
-
-        first_window = [transactions[own_indices[0]]] if own_indices else []
-        result[ATTACK_AVAILABLE] = float(
-            _has_event(first_window, self.ATTACK_KINDS, seat=seat)
-        )
-
-        next_own_index = next(
-            (
-                candidate
-                for candidate in range(index + 1, len(transactions))
-                if transactions[candidate].seat == seat
-            ),
-            None,
-        )
-        if start.active_serial is not None and next_own_index is not None:
-            next_facts = semantic_state_facts(transactions[next_own_index].start_state, seat)
-            result[ACTIVE_SURVIVAL] = float(
-                start.active_serial in next_facts.living_pokemon_serials
-            )
-        elif start.active_serial is not None and not transaction.terminal:
-            end_facts = semantic_state_facts(transaction.end_state, seat)
-            result[ACTIVE_SURVIVAL] = float(
-                start.active_serial in end_facts.living_pokemon_serials
-            )
-
-        for target_index, horizon in (
-            (NET_PRIZE_H1, 1),
-            (NET_PRIZE_H3, 3),
-            (NET_PRIZE_H6, 6),
-        ):
-            horizon_indices = own_indices[:horizon]
-            if not horizon_indices:
-                continue
-            horizon_transaction = transactions[horizon_indices[-1]]
-            end_state = (
-                horizon_transaction.trajectory_terminal_state
-                if horizon_transaction.terminal
-                and horizon_transaction.trajectory_terminal_state is not None
-                else horizon_transaction.end_state
-            )
-            end = semantic_state_facts(end_state, seat)
-            own_gain = start.opponent_prize_count - end.opponent_prize_count
-            opponent_gain = start.self_prize_count - end.self_prize_count
-            result[target_index] = max(-1.0, min(1.0, (own_gain - opponent_gain) / 6.0))
-
-        window_end = own_indices[min(5, len(own_indices) - 1)] if own_indices else index
-        chronological_window = transactions[index : window_end + 1]
-        result[SELF_DECKOUT] = float(
-            _has_event(chronological_window, self.DECKOUT_KINDS, seat=seat)
-            or any(
-                tx.terminal
-                and tx.outcome < 0
-                and (
-                    self._terminal_reason(tx) == "deck_out"
-                    or self._terminal_deck_count(tx, seat) == 0
-                )
-                for tx in chronological_window
-                if tx.seat == seat
-            )
-        )
-
-        next_opponent = next(
-            (tx for tx in transactions[index + 1 :] if tx.seat != seat),
-            None,
-        )
-        if start.rule_lock_ids and next_opponent is not None:
-            opponent_facts = semantic_state_facts(next_opponent.start_state, next_opponent.seat)
-            present = set(start.rule_lock_ids)
-            result[RULE_LOCK] = float(bool(present.intersection(opponent_facts.rule_lock_ids)))
-
-        until_next_own = transactions[index : next_own_index if next_own_index is not None else index + 1]
-        if start.recovery_needed:
-            event_realized = _has_event(until_next_own, self.RECOVERY_KINDS, seat=seat)
-            if next_own_index is not None:
-                next_facts = semantic_state_facts(transactions[next_own_index].start_state, seat)
-                recovered_state = next_facts.active_serial is not None and not next_facts.recovery_needed
-            else:
-                recovered_state = False
-            result[RECOVERY_PATH] = float(event_realized or recovered_state)
-
-        if start.armed_delayed_effect_ids:
-            result[DELAYED_TRIGGER] = float(
-                self._delayed_realized(
-                    until_next_own,
-                    cause_transaction_id=transaction.transaction_id,
-                    armed_ids=set(start.armed_delayed_effect_ids),
-                )
-            )
-        return result
-
-    @staticmethod
-    def _terminal_reason(transaction: Transaction) -> str:
-        if transaction.terminal_reason is not None:
-            return {
-                1: "prizes",
-                2: "deck_out",
-                3: "no_active_pokemon",
-                4: "card_effect",
-            }.get(transaction.terminal_reason, str(transaction.terminal_reason))
-        state = transaction.trajectory_terminal_state or transaction.end_state or {}
-        current = state.get("current") or {} if isinstance(state, Mapping) else {}
-        value = current.get("terminalReason", current.get("terminal_reason", ""))
-        return str(value).lower().replace("-", "_")
-
-    @staticmethod
-    def _terminal_deck_count(transaction: Transaction, seat: int) -> int | None:
-        state = transaction.trajectory_terminal_state or transaction.end_state
-        return semantic_state_facts(state, seat).self_deck_count
-
-    def _delayed_realized(
+    def _build_one(
         self,
-        transactions: Iterable[Transaction],
-        *,
-        cause_transaction_id: int,
-        armed_ids: set[str],
+        timeline: _TrajectoryTimeline,
+        index: int,
+    ) -> tuple[Tensor, Tensor]:
+        transaction = timeline.transactions[index]
+        seat = transaction.seat
+        result = torch.zeros(NUM_SEMANTIC_CONCEPTS, dtype=torch.float32)
+        mask = torch.zeros(NUM_SEMANTIC_CONCEPTS, dtype=torch.bool)
+        windows = timeline.windows(index)
+
+        for concept_index, window, event_seat in (
+            (SELF_ATTACK_CURRENT, windows.current_turn, seat),
+            (OPPONENT_ATTACK_RESPONSE, windows.opponent_response, 1 - seat),
+            (SELF_ATTACK_NEXT, windows.next_self_turn, seat),
+        ):
+            mask[concept_index] = window.applicable
+            if window.applicable:
+                result[concept_index] = float(
+                    self._window_has_attack(timeline, window, event_seat)
+                )
+
+        for concept_index, window in zip(
+            (
+                PRIZE_CURRENT,
+                PRIZE_OPPONENT_RESPONSE,
+                PRIZE_NEXT_SELF,
+                PRIZE_SELF_TURNS_2_TO_3,
+                PRIZE_SELF_TURNS_4_TO_6,
+            ),
+            windows.prize_windows,
+        ):
+            mask[concept_index] = window.applicable
+            if window.applicable:
+                result[concept_index] = self._net_prize_swing(window, seat)
+
+        reached_terminal = timeline.terminal_reached_h6(index)
+        result[TERMINAL_REACHED_H6] = float(reached_terminal)
+        mask[TERMINAL_REACHED_H6] = True
+        if reached_terminal:
+            result[TERMINAL_UTILITY_H6] = timeline.terminal_utility(seat)
+            mask[TERMINAL_UTILITY_H6] = True
+        return result, mask
+
+    def _window_has_attack(
+        self,
+        timeline: _TrajectoryTimeline,
+        window: TransactionWindow,
+        seat: int,
     ) -> bool:
-        for transaction in transactions:
-            for link in transaction.causal_links:
-                if link.cause_transaction_id == cause_transaction_id:
-                    return True
-                if link.source_card_serial is not None and str(link.source_card_serial) in armed_ids:
-                    return True
+        for transaction_index in window.transaction_indices:
+            transaction = timeline.transactions[transaction_index]
             for event in transaction.event_records:
-                if _event_kind(event) not in self.DELAYED_KINDS:
+                if event.seat not in (None, seat):
                     continue
-                if event.cause_transaction_id == cause_transaction_id:
-                    return True
-                if event.source_card_serial is not None and str(event.source_card_serial) in armed_ids:
+                if _event_kind(event) in self.ATTACK_KINDS:
                     return True
         return False
+
+    @staticmethod
+    def _net_prize_swing(window: TransactionWindow, seat: int) -> float:
+        if window.start_state is None or window.end_state is None:
+            raise ValueError("applicable prize window is missing a state boundary")
+        start = semantic_state_facts(window.start_state, seat)
+        end = semantic_state_facts(window.end_state, seat)
+        self_gain = start.self_prize_count - end.self_prize_count
+        opponent_gain = start.opponent_prize_count - end.opponent_prize_count
+        return max(-1.0, min(1.0, (self_gain - opponent_gain) / 6.0))
 
 
 class SemanticConceptHeads(nn.Module):
@@ -438,7 +627,9 @@ class SemanticConceptHeads(nn.Module):
 
     def forward(self, encoded: Tensor, applicable: Tensor) -> SemanticConceptOutput:
         if applicable.shape != encoded.shape[:-1] + (NUM_SEMANTIC_CONCEPTS,):
-            raise ValueError("applicable must have shape [batch, 9]")
+            raise ValueError(
+                f"applicable must end in {NUM_SEMANTIC_CONCEPTS} semantic concepts"
+            )
         logits = torch.stack([member(encoded) for member in self.members], dim=0)
         binary_index = torch.tensor(BINARY_CONCEPT_INDICES, device=encoded.device)
         continuous_index = torch.tensor(CONTINUOUS_CONCEPT_INDICES, device=encoded.device)
@@ -459,7 +650,9 @@ class SemanticConceptHeads(nn.Module):
     @torch.no_grad()
     def set_holdout_reliability(self, reliability: Tensor) -> None:
         if reliability.shape != (NUM_SEMANTIC_CONCEPTS,):
-            raise ValueError("reliability must contain nine values")
+            raise ValueError(
+                f"reliability must contain {NUM_SEMANTIC_CONCEPTS} values"
+            )
         self.holdout_reliability.copy_(reliability.clamp(0.0, 1.0))
 
 
@@ -527,7 +720,9 @@ class SemanticPotentialHead(nn.Module):
         confidence: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         if values.shape[-1] != NUM_SEMANTIC_CONCEPTS:
-            raise ValueError("semantic values must have nine fixed positions")
+            raise ValueError(
+                f"semantic values must have {NUM_SEMANTIC_CONCEPTS} fixed positions"
+            )
         if applicable.shape != values.shape or confidence.shape != values.shape:
             raise ValueError("values, applicable and confidence must have identical shapes")
         mask = applicable.to(dtype=values.dtype)
@@ -595,13 +790,3 @@ class SemanticPotentialHead(nn.Module):
             pre_tanh_logit=float(logit[0].cpu()),
             potential=float(potential[0].cpu()),
         )
-
-
-def reverse_net_prize_perspective(values: Tensor) -> Tensor:
-    """Transform the three signed prize concepts under a seat swap."""
-
-    if values.shape[-1] != NUM_SEMANTIC_CONCEPTS:
-        raise ValueError("values must end in the nine semantic concepts")
-    swapped = values.clone()
-    swapped[..., list(CONTINUOUS_CONCEPT_INDICES)] *= -1.0
-    return swapped

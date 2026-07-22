@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import SelfPlayConfig
+from .config import SCHEMA_VERSION, SelfPlayConfig
 from .league import (
     EvaluationResult,
     LeagueAction,
@@ -24,7 +24,12 @@ from .reward import (
     transaction_gae,
 )
 from .rollout import ObservationVectorizer, RolloutBatch
-from .semantic import SemanticConceptTargets, semantic_applicability, semantic_concept_loss
+from .semantic import (
+    NUM_SEMANTIC_CONCEPTS,
+    SemanticConceptTargets,
+    semantic_applicability,
+    semantic_concept_loss,
+)
 from .transactions import Transaction
 
 
@@ -118,10 +123,11 @@ class FixedCalibrationHoldout:
             concept_predictions=output.concepts.values,
             concept_targets=self.concept_targets.to(target_device),
             applicable=self.target_applicable.to(target_device),
+            semantic_values=output.semantic_value,
             full_values=output.full_value,
             outcome_returns=self.outcome_returns.to(target_device),
+            swapped_semantic_values=swapped_output.semantic_value,
             swapped_full_values=swapped_output.full_value,
-            swapped_concept_predictions=swapped_output.concepts.values,
         )
 
 
@@ -433,10 +439,14 @@ class AsymmetricSelfPlayTrainer:
         if calibration is None:
             metrics.update(
                 {
-                    "semantic_brier": None,
-                    "semantic_ece": None,
+                    "concept_brier_score": None,
+                    "concept_constant_prior_brier": None,
+                    "concept_brier_improvement": None,
+                    "concept_ece": None,
                     "semantic_antisymmetry_error": None,
                     "semantic_ranking_accuracy": None,
+                    "full_antisymmetry_error": None,
+                    "full_ranking_accuracy": None,
                 }
             )
         else:
@@ -474,6 +484,7 @@ class AsymmetricSelfPlayTrainer:
         calibration = self.phase_controller.last_calibration
         return {
             "schema_version": self.config.schema_version,
+            "semantic_concept_count": NUM_SEMANTIC_CONCEPTS,
             "learner": self.learner.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "full_critic": {
@@ -504,8 +515,22 @@ class AsymmetricSelfPlayTrainer:
 
     def load_checkpoint(self, path: str | Path) -> dict[str, Any]:
         payload = torch.load(Path(path), map_location=self.ppo.device)
-        if payload.get("schema_version") != self.config.schema_version:
-            raise ValueError("checkpoint schema does not match transactional semantic v2")
+        checkpoint_schema = payload.get("schema_version")
+        if checkpoint_schema != self.config.schema_version:
+            if checkpoint_schema == "transactional_semantic_selfplay_v2":
+                raise ValueError(
+                    "transactional semantic v2 checkpoint is incompatible with the v3 "
+                    "ten-dimensional semantic heads"
+                )
+            raise ValueError(
+                f"checkpoint schema {checkpoint_schema!r} does not match {SCHEMA_VERSION!r}"
+            )
+        checkpoint_concepts = payload.get("semantic_concept_count")
+        if checkpoint_concepts != NUM_SEMANTIC_CONCEPTS:
+            raise ValueError(
+                "checkpoint semantic concept count does not match the v3 "
+                f"{NUM_SEMANTIC_CONCEPTS}-dimensional schema"
+            )
         self.learner.load_state_dict(payload["learner"])
         self.optimizer.load_state_dict(payload["optimizer"])
         self.target_semantic.load_state_dict(payload["target_semantic"])

@@ -11,7 +11,11 @@ from .semantic import (
     SemanticConceptOutput,
     SemanticConceptTargets,
     SemanticPotentialExplanation,
+    SemanticTimeWindows,
     TrajectoryLabelBuilder,
+    TransactionWindow,
+    TurnGroup,
+    build_turn_groups,
 )
 from .transactions import CausalEventLink, Transaction, TransactionAssembler
 
@@ -28,6 +32,7 @@ __all__ = [
     "SemanticConceptOutput",
     "SemanticConceptTargets",
     "SemanticPotentialExplanation",
+    "SemanticTimeWindows",
     "SemanticSelfPlayModel",
     "SelfPlayConfig",
     "TargetSemanticRewardModule",
@@ -36,7 +41,10 @@ __all__ = [
     "Transaction",
     "TransactionAssembler",
     "TransactionReward",
+    "TransactionWindow",
     "TrajectoryLabelBuilder",
+    "TurnGroup",
+    "build_turn_groups",
     "load_config",
     "transaction_gae",
     "transaction_reward",

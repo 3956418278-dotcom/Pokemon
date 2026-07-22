@@ -1,23 +1,34 @@
 # Current state — competition self-play
 
-Updated: 2026-07-21 (Asia/Shanghai)
+Updated: 2026-07-22 (Asia/Shanghai)
 
 ## Transactional semantic PPO implementation
 
 - The obsolete `RewardVector(outcome, prize_progress, setup_tempo)`, `VectorReward`, actor
   scalarization weights, setup-potential weights, and three-value critic contract have been removed.
-  Config schema is now `transactional_semantic_selfplay_v2`; the critic is scalar.
+  Config schema is now `transactional_semantic_selfplay_v3`; v1/v2 configs and v2 checkpoints are
+  rejected because their semantic heads are incompatible with the fixed ten-dimensional interface.
 - Rollout choices are assembled into causal transactions. Nested resolutions share one summed
   non-forced log probability and one transaction advantage; unique forced choices are recorded but
   excluded from the actor ratio.
 - Phase A is locked to 20,000 completed games of pure terminal `+1/-1/0` transaction-level PPO.
   Concept, semantic-potential, residual, and full-value losses remain active while shaping alpha is
   exactly zero.
-- The fixed nine-position semantic concept ensemble, deterministic applicability masks, automatic
-  completed-trajectory labels, serial-aware survival, delayed causal links, calibrated confidence,
-  bounded semantic potential, and reconstructable explanation interface are connected to training.
-- Phase B can begin only after the fixed holdout simultaneously passes the Brier-improvement, ECE,
-  seat-swap antisymmetry, and ranking gates. Alpha then ramps to 0.15 over 50,000 games.
+- The fixed ten-position semantic ensemble contains current-turn self attack, opponent response
+  attack, next-self-turn attack, five non-overlapping net-prize windows, H6 terminal reach, and
+  conditional terminal utility. Labels group consecutive transactions using the real
+  `current.turn`; a missing turn is an error. Type-15 execution is the only attack signal, and prize
+  direction follows the player whose own prize-zone count drops.
+- The prize windows are I0=current remainder, I1=opponent response, I2=next self turn,
+  I3=self turns 2–3 with intervening play, and I4=self turns 4–6 with intervening play. They satisfy
+  `H1=I0+I1+I2`, `H3=H1+I3`, and `H6=H3+I4`; windows that do not start before terminal are masked.
+- The bounded semantic potential retains its confidence gate, piecewise-linear unary functions,
+  tanh, `[-0.8, 0.8]` clip, and only three learned same-window attack/prize interactions. Former
+  rule-lock, recovery, delayed-trigger, survival, and deck-out concepts remain auxiliary state
+  diagnostics only and are not shaping coordinates.
+- Phase B can begin only after concept Brier improvement/ECE and `semantic_value` antisymmetry/
+  ranking all pass. `full_value` antisymmetry/ranking remain in metrics for critic monitoring but do
+  not participate in admission. Alpha then ramps to 0.15 over 50,000 games.
 - During a rollout batch only the learner policy is updated. Learner seats alternate P0/P1; actor
   loss excludes opponent transactions. The frozen opponent and the complete target semantic path
   remain unchanged until, respectively, a league promotion or the explicit post-update EMA step.
@@ -31,12 +42,15 @@ Updated: 2026-07-21 (Asia/Shanghai)
   labeling → transaction reward/GAE → PPO → post-batch EMA → checkpoint path exists and is tested;
   it does not claim that the 20,000-game Phase A run or the Phase B calibration gate has already
   completed.
-- Verification on 2026-07-21: the maintained branch suite passes 61/61 tests. A no-output smoke
-  game against the official local `cg` runtime completed with 123 transactions, 164 non-forced
-  selects and 22 forced selects, preserved exact terminal reason `2`, produced labels and a compact
-  two-perspective holdout, and completed
-  one PPO update with all four critic losses. Opponent and target parameters stayed bitwise fixed
-  during that update; the target changed only after the explicit EMA boundary.
+- Verification on 2026-07-22: the schema-v3 branch suite passes 65/65 tests and CLI dry-run passes.
+  A two-game smoke
+  against the official local `cg` runtime completed with 267 transactions, 348 non-forced selects,
+  50 forced selects, 55/56 real turn groups, and seven type-15 attack events. Every transaction had
+  ten values/applicability bits; all applicable prize labels matched the real state-boundary formula,
+  and both terminal transactions masked every future window. One PPO update emitted all four critic
+  losses. Opponent and target parameters stayed bitwise fixed during that update; the target changed
+  only after the explicit EMA boundary. The generated report is under
+  `outputs/competition_selfplay/smoke-v3-20260722/` and is intentionally not part of Git.
 
 ## Confirmed intake package
 

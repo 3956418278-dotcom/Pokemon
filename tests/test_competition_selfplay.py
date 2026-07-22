@@ -20,6 +20,7 @@ from competition_selfplay.phase import (
     CalibrationMetrics,
     PhaseController,
     TrainingPhase,
+    calibration_metrics,
 )
 from competition_selfplay.reward import (
     perspective_outcome,
@@ -29,18 +30,24 @@ from competition_selfplay.reward import (
 from competition_selfplay.rollout import AsymmetricRolloutCollector, ObservationVectorizer
 from competition_selfplay.run_mechanical_selfplay import _build_replay
 from competition_selfplay.semantic import (
-    ACTIVE_SURVIVAL,
-    DELAYED_TRIGGER,
-    NET_PRIZE_H1,
+    OPPONENT_ATTACK_RESPONSE,
     NUM_SEMANTIC_CONCEPTS,
-    RECOVERY_PATH,
-    RULE_LOCK,
+    PRIZE_CURRENT,
+    PRIZE_NEXT_SELF,
+    PRIZE_OPPONENT_RESPONSE,
+    PRIZE_SELF_TURNS_2_TO_3,
+    PRIZE_SELF_TURNS_4_TO_6,
+    SELF_ATTACK_CURRENT,
+    SELF_ATTACK_NEXT,
     SEMANTIC_CONCEPT_NAMES,
+    SEMANTIC_INTERACTIONS,
+    TERMINAL_REACHED_H6,
+    TERMINAL_UTILITY_H6,
     SemanticConceptOutput,
     SemanticConceptTargets,
     SemanticPotentialHead,
     TrajectoryLabelBuilder,
-    reverse_net_prize_perspective,
+    build_turn_groups,
     semantic_applicability,
     semantic_concept_loss,
 )
@@ -110,6 +117,45 @@ def _observation(
     }
 
 
+def _completed_trajectory(
+    starts: list[dict],
+    *,
+    winner: int = 0,
+    terminal_prizes: tuple[int, int] | None = None,
+    events: dict[int, list[dict]] | None = None,
+) -> list[Transaction]:
+    if not starts:
+        raise ValueError("trajectory needs at least one start state")
+    last = starts[-1]
+    terminal_state = _observation(
+        seat=int(last["current"]["yourIndex"]),
+        turn=int(last["current"]["turn"]),
+        context=None,
+        options=0,
+        result=winner,
+        prizes=terminal_prizes
+        or tuple(len(player.get("prize") or []) for player in last["current"]["players"]),
+    )
+    transactions: list[Transaction] = []
+    for index, start in enumerate(starts):
+        seat = int(start["current"]["yourIndex"])
+        end_state = starts[index + 1] if index + 1 < len(starts) else terminal_state
+        transaction = Transaction(
+            index,
+            seat,
+            start,
+            end_state=end_state,
+            terminal=index == len(starts) - 1,
+            outcome=(1 if winner == seat else 0 if winner == 2 else -1)
+            if index == len(starts) - 1
+            else 0,
+        )
+        for event in (events or {}).get(index, []):
+            transaction.add_event(event)
+        transactions.append(transaction)
+    return transactions
+
+
 class _FakeEnvironment:
     def __init__(self) -> None:
         self.states = [
@@ -122,12 +168,14 @@ class _FakeEnvironment:
             ),
             _observation(
                 seat=1,
+                turn=2,
                 context=0,
                 options=2,
                 logs=[{"type": 15, "playerIndex": 0, "serial": 10}],
             ),
             _observation(
                 seat=1,
+                turn=2,
                 context=None,
                 options=0,
                 result=0,
@@ -209,7 +257,8 @@ def test_config_and_deck_are_transactional_scalar_and_copy_aware(tmp_path: Path)
     assert config.model.value_dimensions == 1
     assert config.training.gamma == 0.997
     assert config.training.clip_epsilon == 0.2
-    assert len(SEMANTIC_CONCEPT_NAMES) == NUM_SEMANTIC_CONCEPTS == 9
+    assert config.schema_version == "transactional_semantic_selfplay_v3"
+    assert len(SEMANTIC_CONCEPT_NAMES) == NUM_SEMANTIC_CONCEPTS == 10
     assert len(deck.card_ids) == 60
     kangaskhan = [token for token in deck.card_tokens if token.card_id == 756]
     assert [token.copy_ordinal for token in kangaskhan] == [0, 1, 2]
@@ -218,6 +267,14 @@ def test_config_and_deck_are_transactional_scalar_and_copy_aware(tmp_path: Path)
     legacy.write_text("schema_version: fixed_deck_selfplay_v1\n", encoding="utf-8")
     with pytest.raises(ValueError, match="three-dimensional reward config is obsolete"):
         load_config(legacy)
+
+    v2 = tmp_path / "v2.yaml"
+    v2.write_text(
+        "schema_version: transactional_semantic_selfplay_v2\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="v2 is incompatible.*ten-dimensional"):
+        load_config(v2)
 
 
 def test_multilevel_resolution_is_one_transaction_and_forced_select_is_excluded() -> None:
@@ -306,7 +363,7 @@ def test_alpha_zero_is_exact_terminal_reward_and_terminal_phi_is_zero() -> None:
     assert terminal.total == pytest.approx(1.0 - 0.15 * 0.2)
 
     head = SemanticPotentialHead(knot_count=3)
-    value = torch.full((1, 9), 0.5)
+    value = torch.full((1, NUM_SEMANTIC_CONCEPTS), 0.5)
     mask = torch.ones_like(value, dtype=torch.bool)
     confidence = torch.ones_like(value)
     assert head(value, mask, confidence, terminal=torch.tensor([True])).item() == 0.0
@@ -358,31 +415,21 @@ def test_phase_b_actor_set_contains_only_learner_transactions() -> None:
     )
 
 
-def test_applicability_is_a_state_fact_and_masks_concept_loss() -> None:
-    state = _observation(
-        active_serials=(None, 20),
-        semantic_facts={
-            "rule_lock_ids": [],
-            "armed_delayed_effect_ids": [],
-            "recovery_needed": True,
-        },
-    )
-    mask = semantic_applicability(state, 0)
-    assert not mask[ACTIVE_SURVIVAL]
-    assert not mask[RULE_LOCK]
-    assert mask[RECOVERY_PATH]
-    assert not mask[DELAYED_TRIGGER]
+def test_ten_dimensional_applicability_mask_controls_concept_loss() -> None:
+    mask = semantic_applicability(_observation(), 0)
+    assert mask.shape == (NUM_SEMANTIC_CONCEPTS,)
+    assert mask.all()
 
-    values = torch.full((1, 9), 0.25)
+    values = torch.full((1, NUM_SEMANTIC_CONCEPTS), 0.25)
     target_values = torch.zeros_like(values)
     target_mask = torch.ones_like(values, dtype=torch.bool)
-    target_mask[:, RULE_LOCK] = False
+    target_mask[:, TERMINAL_UTILITY_H6] = False
     output = SemanticConceptOutput(values, target_mask, torch.ones_like(values))
     baseline = semantic_concept_loss(
         output,
         SemanticConceptTargets(target_values, target_mask),
     )
-    target_values[:, RULE_LOCK] = 1.0
+    target_values[:, TERMINAL_UTILITY_H6] = 1.0
     changed_only_under_mask = semantic_concept_loss(
         output,
         SemanticConceptTargets(target_values, target_mask),
@@ -390,61 +437,164 @@ def test_applicability_is_a_state_fact_and_masks_concept_loss() -> None:
     assert baseline == changed_only_under_mask
 
 
-def test_observable_stadium_rule_lock_persistence_is_labeled_without_card_id_rules() -> None:
-    start = _observation()
-    start["current"]["stadium"] = [{"id": 123, "serial": 77, "playerIndex": 0}]
-    opponent_start = _observation(seat=1)
-    opponent_start["current"]["stadium"] = [
-        {"id": 123, "serial": 77, "playerIndex": 0}
+def test_turn_groups_use_real_turn_and_first_root_owner() -> None:
+    nested = _observation(seat=0, turn=7, context=5)
+    root = _observation(seat=1, turn=7, context=0)
+    terminal = _observation(seat=1, turn=7, context=None, options=0, result=1)
+    transactions = [
+        Transaction(0, 0, nested, end_state=root),
+        Transaction(1, 1, root, end_state=terminal, terminal=True, outcome=1),
     ]
-    first = Transaction(0, 0, start, end_state=opponent_start)
-    second = Transaction(1, 1, opponent_start, terminal=True, outcome=-1)
-    targets = TrajectoryLabelBuilder().build([first, second])
-    assert targets.applicable[0, RULE_LOCK]
-    assert targets.values[0, RULE_LOCK] == 1.0
+    groups = build_turn_groups(transactions)
+    assert groups[0].turn_id == 7
+    assert groups[0].owner_seat == 1
+    assert groups[0].transaction_indices == (0, 1)
+
+    missing_turn = _observation()
+    missing_turn["current"].pop("turn")
+    with pytest.raises(ValueError, match="missing current.turn"):
+        TrajectoryLabelBuilder().build(
+            [Transaction(2, 0, missing_turn, end_state=terminal, terminal=True)]
+        )
 
 
-def test_trajectory_labels_use_physical_serial_and_signed_prize_horizons() -> None:
-    first = Transaction(
-        0,
-        0,
-        _observation(active_serials=(41, 20), prizes=(6, 6)),
-        end_state=_observation(active_serials=(41, 20), prizes=(6, 5)),
-        event_records=[],
-    )
-    first.add_event({"kind": "attack_executed", "seat": 0, "source_card_serial": 41})
-    opponent = Transaction(1, 1, _observation(seat=1, active_serials=(41, 20)))
-    next_own = Transaction(2, 0, _observation(active_serials=(41, 20)), terminal=True, outcome=1)
-    targets = TrajectoryLabelBuilder().build([first, opponent, next_own])
-    assert targets.values[0, 0] == 1.0
-    assert targets.values[0, ACTIVE_SURVIVAL] == 1.0
-    assert targets.values[0, NET_PRIZE_H1] == pytest.approx(1 / 6)
-
-    different_serial = Transaction(3, 0, _observation(active_serials=(99, 20)))
-    replaced = TrajectoryLabelBuilder().build([first, opponent, different_serial])
-    assert replaced.values[0, ACTIVE_SURVIVAL] == 0.0
-
-    evolved_on_bench_state = _observation(active_serials=(55, 20))
-    evolved_on_bench_state["current"]["players"][0]["bench"] = [
-        {"id": 999, "serial": 99, "preEvolution": [{"id": 998, "serial": 41}]}
+def test_five_prize_windows_are_disjoint_and_reconstruct_horizons() -> None:
+    prizes = [
+        (6, 6),
+        (5, 6),
+        (5, 5),
+        (4, 5),
+        (4, 5),
+        (4, 5),
+        (4, 5),
+        (3, 4),
+        (3, 4),
+        (3, 4),
+        (3, 4),
+        (3, 4),
+        (3, 4),
     ]
-    evolved_on_bench = Transaction(4, 0, evolved_on_bench_state)
-    survived_move = TrajectoryLabelBuilder().build([first, opponent, evolved_on_bench])
-    assert survived_move.values[0, ACTIVE_SURVIVAL] == 1.0
-
-
-def test_deckout_label_uses_exact_terminal_result_reason() -> None:
-    transaction = Transaction(
-        0,
-        0,
-        _observation(),
-        end_state=_observation(context=None, result=1),
-        terminal=True,
-        outcome=-1,
-        terminal_reason=2,
+    starts = [
+        _observation(seat=index % 2, turn=index + 1, prizes=value)
+        for index, value in enumerate(prizes)
+    ]
+    transactions = _completed_trajectory(
+        starts,
+        winner=0,
+        terminal_prizes=(2, 4),
     )
-    targets = TrajectoryLabelBuilder().build([transaction])
-    assert targets.values[0, 5] == 1.0
+    windows = TrajectoryLabelBuilder.time_windows(transactions, 0)
+    index_sets = [set(window.transaction_indices) for window in windows.prize_windows]
+    assert all(window.applicable for window in windows.prize_windows)
+    assert all(
+        not left.intersection(right)
+        for left_index, left in enumerate(index_sets)
+        for right in index_sets[left_index + 1 :]
+    )
+    assert tuple(window.transaction_indices for window in windows.prize_windows) == (
+        (0,),
+        (1,),
+        (2,),
+        (3, 4, 5, 6),
+        (7, 8, 9, 10, 11, 12),
+    )
+
+    targets = TrajectoryLabelBuilder().build(transactions)
+    c3, c4, c5, c6, c7 = targets.values[0, 3:8].tolist()
+    assert c3 == pytest.approx(1 / 6)
+    assert c4 == pytest.approx(-1 / 6)
+    assert c5 == pytest.approx(1 / 6)
+    assert c6 == pytest.approx(0.0)
+    assert c7 == pytest.approx(1 / 6)
+    assert c3 + c4 + c5 == pytest.approx(1 / 6)
+    assert c3 + c4 + c5 + c6 == pytest.approx(1 / 6)
+    assert c3 + c4 + c5 + c6 + c7 == pytest.approx(2 / 6)
+
+
+def test_attacks_land_only_in_current_response_and_next_self_windows() -> None:
+    starts = [
+        _observation(seat=0, turn=1),
+        _observation(seat=1, turn=2),
+        _observation(seat=0, turn=3),
+        _observation(seat=1, turn=4),
+    ]
+    all_attacks = _completed_trajectory(
+        starts,
+        events={
+            0: [{"kind": "attack_executed", "seat": 0}],
+            1: [{"kind": "15", "seat": 1}],
+            2: [{"kind": "attack_executed", "seat": 0}],
+        },
+    )
+    targets = TrajectoryLabelBuilder().build(all_attacks)
+    assert torch.equal(targets.values[0, :3], torch.ones(3))
+
+    only_next = _completed_trajectory(
+        starts,
+        events={2: [{"kind": "attack_executed", "seat": 0}]},
+    )
+    next_targets = TrajectoryLabelBuilder().build(only_next)
+    assert torch.equal(next_targets.values[0, :3], torch.tensor([0.0, 0.0, 1.0]))
+
+
+def test_prize_swing_direction_tracks_the_player_who_takes_a_prize() -> None:
+    self_gain = _completed_trajectory(
+        [
+            _observation(seat=0, turn=1, prizes=(6, 6)),
+            _observation(seat=1, turn=2, prizes=(5, 6)),
+        ],
+        terminal_prizes=(5, 6),
+    )
+    opponent_gain = _completed_trajectory(
+        [
+            _observation(seat=0, turn=1, prizes=(6, 6)),
+            _observation(seat=1, turn=2, prizes=(6, 5)),
+        ],
+        terminal_prizes=(6, 5),
+    )
+    assert TrajectoryLabelBuilder().build(self_gain).values[0, PRIZE_CURRENT] == pytest.approx(
+        1 / 6
+    )
+    assert TrajectoryLabelBuilder().build(opponent_gain).values[
+        0, PRIZE_CURRENT
+    ] == pytest.approx(-1 / 6)
+
+
+def test_terminal_in_current_turn_keeps_current_and_masks_future_windows() -> None:
+    transaction = _completed_trajectory(
+        [_observation(seat=0, turn=1)],
+        winner=0,
+        events={0: [{"kind": "attack_executed", "seat": 0}]},
+    )
+    targets = TrajectoryLabelBuilder().build(transaction)
+    assert targets.applicable[0, SELF_ATTACK_CURRENT]
+    assert targets.applicable[0, PRIZE_CURRENT]
+    assert not targets.applicable[
+        0,
+        [
+            OPPONENT_ATTACK_RESPONSE,
+            SELF_ATTACK_NEXT,
+            PRIZE_OPPONENT_RESPONSE,
+            PRIZE_NEXT_SELF,
+            PRIZE_SELF_TURNS_2_TO_3,
+            PRIZE_SELF_TURNS_4_TO_6,
+        ],
+    ].any()
+    assert targets.values[0, TERMINAL_REACHED_H6] == 1.0
+    assert targets.applicable[0, TERMINAL_UTILITY_H6]
+    assert targets.values[0, TERMINAL_UTILITY_H6] == 1.0
+
+
+def test_terminal_after_h6_masks_conditional_terminal_utility() -> None:
+    starts = [
+        _observation(seat=index % 2, turn=index + 1)
+        for index in range(14)
+    ]
+    targets = TrajectoryLabelBuilder().build(_completed_trajectory(starts, winner=0))
+    assert targets.applicable[0, TERMINAL_REACHED_H6]
+    assert targets.values[0, TERMINAL_REACHED_H6] == 0.0
+    assert not targets.applicable[0, TERMINAL_UTILITY_H6]
+    assert targets.values[0, TERMINAL_UTILITY_H6] == 0.0
 
 
 def test_option_features_resolve_hand_index_to_physical_card_identity() -> None:
@@ -491,9 +641,9 @@ def test_semantic_explanation_exactly_reconstructs_pre_tanh_logit() -> None:
         head.interaction_weights.copy_(torch.linspace(-0.2, 0.3, len(head.interaction_weights)))
         for index, function in enumerate(head.unary_functions):
             function.knot_values.copy_(torch.linspace(-0.1, 0.2, 4) + index * 0.01)
-    values = torch.linspace(0.1, 0.9, 9)
-    mask = torch.ones(9, dtype=torch.bool)
-    confidence = torch.linspace(0.6, 1.0, 9)
+    values = torch.linspace(0.1, 0.9, NUM_SEMANTIC_CONCEPTS)
+    mask = torch.ones(NUM_SEMANTIC_CONCEPTS, dtype=torch.bool)
+    confidence = torch.linspace(0.6, 1.0, NUM_SEMANTIC_CONCEPTS)
     explanation = head.explain(values, mask, confidence)
     reconstructed = (
         explanation.bias
@@ -504,13 +654,13 @@ def test_semantic_explanation_exactly_reconstructs_pre_tanh_logit() -> None:
     assert -0.8 <= explanation.potential <= 0.8
 
 
-def test_seat_swap_reverses_signed_prize_concepts_and_scalar_value_direction() -> None:
-    values = torch.arange(9, dtype=torch.float32)
-    swapped = reverse_net_prize_perspective(values)
-    assert torch.equal(swapped[[2, 3, 4]], -values[[2, 3, 4]])
-    assert torch.equal(swapped[[0, 1, 5, 6, 7, 8]], values[[0, 1, 5, 6, 7, 8]])
-    p0_value, p1_value = 0.4, -0.4
-    assert p0_value == -p1_value
+def test_semantic_potential_keeps_only_three_same_window_interactions() -> None:
+    assert SEMANTIC_INTERACTIONS == (
+        (SELF_ATTACK_CURRENT, PRIZE_CURRENT),
+        (OPPONENT_ATTACK_RESPONSE, PRIZE_OPPONENT_RESPONSE),
+        (SELF_ATTACK_NEXT, PRIZE_NEXT_SELF),
+    )
+    assert len(SemanticPotentialHead().interaction_weights) == 3
 
 
 def test_gae_counts_transactions_not_nested_selects() -> None:
@@ -532,8 +682,11 @@ def test_semantic_residual_and_full_gradient_boundaries_are_identifiable() -> No
     config = load_config(CONFIG)
     model = SemanticSelfPlayModel(config.model)
     states = torch.randn(3, config.model.observation_dimensions)
-    mask = torch.ones(3, 9, dtype=torch.bool)
-    targets = SemanticConceptTargets(torch.zeros(3, 9), mask)
+    mask = torch.ones(3, NUM_SEMANTIC_CONCEPTS, dtype=torch.bool)
+    targets = SemanticConceptTargets(
+        torch.zeros(3, NUM_SEMANTIC_CONCEPTS),
+        mask,
+    )
     returns = torch.tensor([1.0, 0.0, -1.0])
 
     output = model(states, mask)
@@ -581,7 +734,7 @@ def test_confidence_is_ensemble_derived_detached_and_cannot_collapse_by_gradient
     model = SemanticSelfPlayModel(config.model)
     output = model(
         torch.randn(2, config.model.observation_dimensions),
-        torch.ones(2, 9, dtype=torch.bool),
+        torch.ones(2, NUM_SEMANTIC_CONCEPTS, dtype=torch.bool),
     )
     assert not output.concepts.confidence.requires_grad
     assert not any("confidence_head" in name for name, _ in model.named_parameters())
@@ -591,7 +744,16 @@ def test_confidence_is_ensemble_derived_detached_and_cannot_collapse_by_gradient
 def test_phase_a_gate_and_phase_b_ramp_are_locked() -> None:
     config = load_config(CONFIG)
     phase = PhaseController(config.reward, completed_games=19_999)
-    passing = CalibrationMetrics(0.1, 0.2, 0.5, 0.05, 0.04, 0.7)
+    passing = CalibrationMetrics(
+        concept_brier_score=0.1,
+        concept_constant_prior_brier=0.2,
+        concept_brier_improvement=0.5,
+        concept_ece=0.05,
+        semantic_antisymmetry_error=0.04,
+        semantic_ranking_accuracy=0.7,
+        full_antisymmetry_error=10.0,
+        full_ranking_accuracy=0.0,
+    )
     assert phase.consider_calibration(passing).passed
     assert phase.phase is TrainingPhase.PHASE_A
     assert phase.shaping_alpha() == 0.0
@@ -603,6 +765,40 @@ def test_phase_a_gate_and_phase_b_ramp_are_locked() -> None:
     assert phase.shaping_alpha() == pytest.approx(0.075)
     phase.record_completed_games(25_000)
     assert phase.shaping_alpha() == pytest.approx(0.15)
+
+
+def test_phase_b_gate_uses_semantic_value_while_full_metrics_are_monitor_only() -> None:
+    config = load_config(CONFIG)
+    targets = torch.zeros(3, NUM_SEMANTIC_CONCEPTS)
+    binary_indices = [
+        SELF_ATTACK_CURRENT,
+        OPPONENT_ATTACK_RESPONSE,
+        SELF_ATTACK_NEXT,
+        TERMINAL_REACHED_H6,
+    ]
+    targets[:, binary_indices] = torch.tensor(
+        [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 1.0, 1.0]]
+    )
+    metrics = calibration_metrics(
+        concept_predictions=targets.clone(),
+        concept_targets=targets,
+        applicable=torch.ones_like(targets, dtype=torch.bool),
+        semantic_values=torch.tensor([1.0, 0.0, -1.0]),
+        full_values=torch.tensor([-1.0, 0.0, 1.0]),
+        outcome_returns=torch.tensor([-1.0, 0.0, 1.0]),
+        swapped_semantic_values=torch.tensor([-1.0, 0.0, 1.0]),
+        swapped_full_values=torch.tensor([1.0, 0.0, -1.0]),
+    )
+    assert metrics.semantic_ranking_accuracy == 0.0
+    assert metrics.full_ranking_accuracy == 1.0
+    assert metrics.semantic_antisymmetry_error == 0.0
+    assert metrics.full_antisymmetry_error == 0.0
+    decision = PhaseController(
+        config.reward,
+        completed_games=config.reward.phase_a_games,
+    ).consider_calibration(metrics)
+    assert not decision.passed
+    assert decision.failures == ("semantic_ranking",)
 
 
 def test_checkpoint_payload_contains_all_training_boundaries(tmp_path: Path) -> None:
@@ -627,6 +823,7 @@ def test_checkpoint_payload_contains_all_training_boundaries(tmp_path: Path) -> 
         "shaping_alpha",
         "calibration_metrics",
         "config_snapshot",
+        "semantic_concept_count",
     }
     assert required.issubset(payload)
     checkpoint = trainer.save_checkpoint(tmp_path / "checkpoint.pt")
@@ -639,6 +836,13 @@ def test_checkpoint_payload_contains_all_training_boundaries(tmp_path: Path) -> 
         trainer.calibration_holdout.states,
         payload["calibration_holdout"].states,
     )
+
+    v2_payload = dict(payload)
+    v2_payload["schema_version"] = "transactional_semantic_selfplay_v2"
+    v2_checkpoint = tmp_path / "v2-checkpoint.pt"
+    torch.save(v2_payload, v2_checkpoint)
+    with pytest.raises(ValueError, match="v2 checkpoint is incompatible.*ten-dimensional"):
+        trainer.load_checkpoint(v2_checkpoint)
 
 
 def test_obsolete_three_dimensional_reward_symbols_are_absent() -> None:
@@ -687,7 +891,10 @@ def test_dry_run_reports_transactional_semantic_contract_without_writes() -> Non
     result = dry_run(CONFIG)
     assert result["source_submission_ref"] == 54815037
     assert result["value_dimensions"] == 1
-    assert len(result["semantic_concepts"]) == 9
+    assert result["schema_version"] == "transactional_semantic_selfplay_v3"
+    assert len(result["semantic_concepts"]) == result["semantic_concept_count"] == 10
+    assert result["prize_windows"] == ["I0", "I1", "I2", "I3", "I4"]
+    assert result["phase_b_gate_value"] == "semantic_value"
     assert result["phase_b_calibration_gated"] is True
 
 

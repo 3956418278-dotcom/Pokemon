@@ -30,12 +30,14 @@ padding 和 unknown。该路线不依赖旧的全局静态卡牌特征产物。
 
 ## 当前门槛
 
-正式训练路径已替换为因果事务级 PPO。Phase A 前 20,000 个完整对局严格使用 `+1/-1/0`
-终局奖励，同时训练固定九维语义概念、校准语义势、残差值与标量 full critic；通过固定 holdout
-的 Brier、ECE、座位反对称和排序门后才进入 Phase B，并在 50,000 局内把语义势差系数升至
-0.15。每批只更新 learner；frozen opponent 仅随 league 晋升，完整 target semantic 路径仅在
-批次更新结束后做 EMA。实现和测试已具备开始 Phase A 的条件，但尚未声称 20,000 局训练或
-Phase B 校准已经完成。
+正式训练路径已替换为因果事务级 PPO，schema v3 固定为十维事务语义接口。五个 prize 坐标
+分别覆盖互不重叠的 I0–I4，可精确重构 H1/H3/H6；攻击标签只认真实 type-15 结算事件。
+Phase A 前 20,000 个完整对局严格使用 `+1/-1/0` 终局奖励，同时训练语义概念、校准语义势、
+残差值与标量 full critic。固定 holdout 的 Brier/ECE 与 `semantic_value` 自身的座位反对称/排序
+门通过后才进入 Phase B；`full_value` 指标只监控 critic，不能替语义势过门。之后在 50,000 局
+内把语义势差系数升至 0.15。每批只更新 learner；frozen opponent 仅随 league 晋升，完整
+target semantic 路径仅在批次更新结束后做 EMA。实现、测试和两局真实 `cg` smoke 已具备开始
+Phase A 的条件，但尚未声称 20,000 局训练或 Phase B 校准已经完成。
 
 提交 `54825132` 及其 `audit-006` 对局已被明确排除为训练材料。当前机械候选必须先通过 replay
 人工抽检，详细状态见 `records/competition_selfplay/CURRENT.md`。

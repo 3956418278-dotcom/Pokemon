@@ -7,8 +7,25 @@ from typing import Any
 import yaml
 
 
-SCHEMA_VERSION = "transactional_semantic_selfplay_v2"
-LEGACY_SCHEMA_VERSIONS = frozenset({"fixed_deck_selfplay_v1"})
+SCHEMA_VERSION = "transactional_semantic_selfplay_v3"
+LEGACY_SCHEMA_VERSIONS = frozenset(
+    {
+        "fixed_deck_selfplay_v1",
+        "transactional_semantic_selfplay_v2",
+    }
+)
+
+
+def _legacy_schema_error(schema_version: str) -> ValueError:
+    if schema_version == "transactional_semantic_selfplay_v2":
+        return ValueError(
+            "transactional semantic v2 is incompatible with the v3 ten-dimensional "
+            f"semantic heads; start a new run with schema_version={SCHEMA_VERSION!r}"
+        )
+    return ValueError(
+        "legacy three-dimensional reward config is obsolete; migrate to "
+        f"schema_version={SCHEMA_VERSION!r} and remove actor/setup weights"
+    )
 
 
 @dataclass(frozen=True)
@@ -95,10 +112,7 @@ class SelfPlayConfig:
 
     def validate(self) -> None:
         if self.schema_version in LEGACY_SCHEMA_VERSIONS:
-            raise ValueError(
-                "legacy three-dimensional reward config is obsolete; migrate to "
-                f"schema_version={SCHEMA_VERSION!r} and remove actor/setup weights"
-            )
+            raise _legacy_schema_error(self.schema_version)
         if self.schema_version != SCHEMA_VERSION:
             raise ValueError(f"unsupported schema_version: {self.schema_version}")
         if self.model.value_dimensions != 1:
@@ -154,10 +168,7 @@ def load_config(path: str | Path) -> SelfPlayConfig:
         raise ValueError("self-play config must be a mapping")
     schema_version = str(payload.get("schema_version", ""))
     if schema_version in LEGACY_SCHEMA_VERSIONS:
-        raise ValueError(
-            "legacy three-dimensional reward config is obsolete; expected "
-            f"schema_version={SCHEMA_VERSION!r}"
-        )
+        raise _legacy_schema_error(schema_version)
     reward_payload = _section(payload, "reward")
     config = SelfPlayConfig(
         schema_version=schema_version,

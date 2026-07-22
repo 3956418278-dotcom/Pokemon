@@ -1,4 +1,4 @@
-schema_version: transactional_semantic_selfplay_v2
+schema_version: transactional_semantic_selfplay_v3
 
 target_deck:
   source: decks/baseline_decks.json
